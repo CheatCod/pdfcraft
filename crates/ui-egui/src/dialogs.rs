@@ -13,6 +13,7 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
     dialogs(app, ctx);
     // Last, so it sits above Document Properties when Security's Unlock… asked for it.
     unlock(app, ctx);
+    crate::js_ui::confirmation_dialog(app, ctx);
 }
 
 fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {

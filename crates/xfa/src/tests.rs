@@ -894,8 +894,8 @@ fn choice_lists_signatures_passwords_and_pictures_become_fields_and_images() {
     assert!((images[0].0.w - 72.0).abs() < 0.01 && (images[0].0.h - 72.0).abs() < 0.01, "a square picture fills a 1in square: {:?}", images[0].0);
     assert_eq!(images[1].1, TINY_GIF.len());
     let t = texts(p1);
-    assert!(t.iter().any(|s| s == "12345"), "the barcode's value as text: {t:?}");
-    assert!(form.warnings.iter().any(|w| w.contains("barcode")), "{:?}", form.warnings);
+    assert!(!t.iter().any(|s| s == "12345"), "unsupported barcodes must not look successfully encoded: {t:?}");
+    assert!(form.warnings.iter().any(|w| w.contains("barcode type")), "{:?}", form.warnings);
     assert!(!form.warnings.iter().any(|w| w.contains("can't be chosen")), "pictures can be chosen now: {:?}", form.warnings);
 
     // Written into the PDF: /Ch fields with their options and flags, a /Sig field, a password
@@ -983,7 +983,8 @@ fn pictures_are_sized_from_their_headers_and_hostile_ones_are_refused_unallocate
     assert_eq!(size(&tiny_png()), Some((2, 2)));
     assert_eq!(kind(TINY_GIF), Some(Kind::Gif));
     assert_eq!(size(TINY_GIF), Some((1, 1)));
-    assert_eq!(kind(b"BM..."), None);
+    assert_eq!(kind(b"BM..."), Some(Kind::Bmp));
+    assert!(decode(b"BM...").is_err());
     assert_eq!(size(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), None, "a header cut short");
     let decoded = decode(&tiny_png()).unwrap();
     assert_eq!((decoded.width, decoded.height, decoded.color_space), (2, 2, "DeviceRGB"));
@@ -1094,7 +1095,7 @@ fn pictures_are_embedded_once_across_relayouts_and_bad_data_pictures_are_reporte
     assert!(!root.as_dict().unwrap().contains(b"PCXfaImages"));
     // Pictures in the data that aren't pictures: a warning naming the field, the template's
     // picture shown instead.
-    for (data, what) in [("Qk0AAAAA", "not a JPEG, PNG or GIF"), ("not base64!", "not base64")] {
+    for (data, what) in [("UklGRg==", "not a JPEG, PNG, GIF, TIFF or BMP"), ("not base64!", "not base64")] {
         let tpl = fields_template(&format!("<form><page1><photo>{data}</photo></page1></form>"));
         let form = layout_xml(&tpl).unwrap();
         assert!(form.warnings.iter().any(|w| w.contains("photo") && w.contains(what)), "{what}: {:?}", form.warnings);
@@ -2066,4 +2067,201 @@ fn som_indices_count_earlier_same_named_siblings() {
     let children = [draw(Some("a")), draw(Some("b")), draw(Some("a")), draw(None), draw(Some("a")), draw(Some("b"))];
     let sibs = SomIndices::of(&children);
     assert_eq!((0..=children.len()).map(|i| sibs.at(i)).collect::<Vec<_>>(), [0, 0, 1, 0, 2, 1, 0]);
+}
+
+#[test]
+fn script_variables_and_validation_properties_are_in_the_live_form() {
+    let (t, _) = crate::parse(r#"<template><subform name="form"><variables><script name="helpers" contentType="application/x-javascript">function valid() { return false; }</script><text name="state">ready</text></variables><field name="month"><ui><textEdit/></ui><validate nullTest="error"><message><text name="scriptTest">Month is invalid</text></message></validate></field></subform></template>"#).unwrap();
+    let live = crate::form_tree(&t, None, &crate::Overrides::default());
+    let month = live.root.children.iter().find(|n| n.name == "month").unwrap();
+    assert_eq!(month.properties.get("validate.nullTest").map(String::as_str), Some("error"));
+    assert_eq!(month.properties.get("validationMessage").map(String::as_str), Some("Month is invalid"));
+    assert!(live.root.children.iter().any(|n| n.name == "helpers" && n.kind == Some(crate::NodeKind::Script)));
+    assert!(live.root.children.iter().any(|n| n.name == "state" && n.value == "ready"));
+}
+
+#[test]
+fn xfa_text_uses_the_metrics_of_the_face_written_to_the_pdf() {
+    let face = crate::text::Face {
+        family: crate::text::Family::Times,
+        bold: true,
+        italic: true,
+        size: 12.0,
+        color: [0.0; 3],
+        underline: false,
+        letter_spacing: 0.0,
+    };
+    assert_eq!(face.width("Wide italics Wi"), pdfcraft_fonts::Std14::TimesBoldItalic.text_width("Wide italics Wi", 12.0));
+}
+
+#[test]
+fn explicit_data_bindings_skip_layout_containers_and_repeat_bound_aliases() {
+    let xml = r#"<xdp xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+    <subform name="application"><subform name="page"><bind match="none"/>
+      <field name="displayName"><bind match="dataRef" ref="$.Person.Family"/><ui><textEdit/></ui></field>
+      <field name="scratch"><bind match="none"/><value><text>local</text></value><ui><textEdit/></ui></field>
+      <subform name="row"><occur min="1" max="-1"/><bind match="dataRef" ref="$.Trips.Trip[*]"/>
+        <field name="year"><bind match="dataRef" ref="$.From.Year"/><ui><textEdit/></ui></field>
+      </subform>
+    </subform></subform></template>
+    <xfa:datasets><xfa:data><application><Person><Family>Sample</Family></Person><Trips><Trip><From><Year>2020</Year></From></Trip><Trip><From><Year>2021</Year></From></Trip></Trips></application></xfa:data></xfa:datasets></xdp>"#;
+    let (tpl, _) = parse(xml).unwrap();
+    let path = |som| data_path(&tpl, som);
+    assert_eq!(path("application[0].page[0].displayName[0]"), som_to_path("application.Person.Family"));
+    assert!(path("application[0].page[0].scratch[0]").is_empty());
+    assert_eq!(path("application[0].page[0].row[1].year[0]"), som_to_path("application.Trips.Trip[1].From.Year"));
+    let data = data::parse_datasets(xml).unwrap();
+    let live = form_tree(&tpl, Some(&data), &Overrides::default());
+    assert!(format!("{live:?}").contains("2021"), "second bound instance must exist");
+    assert!(format!("{live:?}").contains("Sample"));
+}
+
+#[test]
+fn embedded_choice_sources_supply_labels_and_export_codes() {
+    let xml = r#"<xdp xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form"><field name="country"><ui><choiceList/></ui><bindItems ref="xfa.datasets.lists.countries.country[*]" labelRef="$" valueRef="code"/></field></subform></template><xfa:datasets><xfa:data/><lists><countries><country code="CA">Canada</country><country code="JP">Japan</country></countries></lists></xfa:datasets></xdp>"#;
+    let (tpl, _) = parse(xml).unwrap();
+    let Node::Field(field) = &tpl.root.children[0] else { panic!("field") };
+    assert_eq!(field.items, ["Canada", "Japan"]);
+    assert_eq!(field.item_values, ["CA", "JP"]);
+}
+
+#[test]
+fn xfa_letter_spacing_survives_the_generated_default_appearance() {
+    let xml = crate::fixtures::template(0)
+        .replace("typeface=\"Courier New\" size=\"9pt\"", "typeface=\"Courier New\" size=\"9pt\" letterSpacing=\"1.5em\"");
+    let form = layout_xml(&xml).unwrap();
+    let field = form.pages.iter().flat_map(widgets).find(|w| w.name == "familyName").unwrap();
+    assert_eq!(field.face.letter_spacing, 13.5);
+    assert!((field.face.width("1234") - (4.0 * 5.4 + 3.0 * 13.5)).abs() < 0.01);
+}
+
+#[test]
+fn embedded_tiff_is_decoded_and_hostile_dimensions_are_bounded() {
+    use ::image::ImageEncoder;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    ::image::codecs::tiff::TiffEncoder::new(&mut bytes).write_image(&[255, 0, 0, 0, 255, 0], 2, 1, ::image::ExtendedColorType::Rgb8).unwrap();
+    assert_eq!(image::size(bytes.get_ref()), Some((2, 1)));
+    let decoded = image::decode(bytes.get_ref()).unwrap();
+    assert_eq!(decoded.samples, [255, 0, 0, 0, 255, 0]);
+    assert!(image::decode(b"II\x2a\x00\xff\xff\xff\xff").is_err());
+}
+
+#[test]
+fn load_xml_updates_only_the_selected_auxiliary_dataset() {
+    let xml = crate::fixtures::template(0).replace("</xdp:xdp>", "<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data><form><keep>retained</keep></form></xfa:data><lists><old/></lists></xfa:datasets></xdp:xdp>");
+    let mut doc = pdfcraft_cos::Document::open(std::sync::Arc::new(crate::fixtures::shell(&xml))).unwrap();
+    data::load_dataset_xml(&mut doc, &som_to_path("lists"), "<countries><country code=\"CA\">Canada</country></countries>", false, true, None)
+        .unwrap();
+    let packet = data::datasets_packet(&doc).unwrap().unwrap();
+    assert!(packet.contains("<keep>retained</keep>"));
+    assert!(packet.contains("<countries><country code=\"CA\">Canada</country></countries>"));
+    assert!(!packet.contains("<old/>"));
+    assert!(
+        data::load_dataset_xml(&mut doc, &som_to_path("lists"), "<!DOCTYPE x [<!ENTITY a SYSTEM 'file:///private'>]><x>&a;</x>", false, true, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn numeric_binding_picture_gives_scripts_an_unpadded_string() {
+    let xml = r#"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form"><field name="month"><ui><textEdit/></ui><bind><picture>num{99}</picture></bind><value><text>05</text></value></field></subform></template>"#;
+    let (tpl, _) = parse(xml).unwrap();
+    let live = form_tree(&tpl, None, &Overrides::default());
+    assert_eq!(live.root.children[0].value, "5");
+    assert!(!live.root.children[0].numeric, "the text value remains a string");
+}
+
+#[test]
+fn a_widthless_centred_label_uses_its_text_width() {
+    let xml = r#"<template><subform name="form"><draw name="year" x="40pt" y="10pt"><font typeface="Arial" size="8pt"/><para hAlign="center"/><value><text>YYYY</text></value></draw></subform></template>"#;
+    let form = layout_xml(xml).unwrap();
+    let span = form.pages[0]
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Text(s) if s.text == "YYYY" => Some(s),
+            _ => None,
+        })
+        .unwrap();
+    assert!((span.x - 76.0).abs() < 0.1, "{span:?}");
+}
+
+#[test]
+fn embedded_hidden_field_text_reads_its_bound_value() {
+    let xml = r##"<xdp><template><subform name="form"><pageSet><pageArea name="master"><medium short="300pt" long="400pt"/><contentArea x="20pt" y="50pt" w="260pt" h="300pt"/>
+<field name="reference" id="reference" presence="hidden"><ui><textEdit/></ui></field>
+<draw x="20pt" y="10pt" w="200pt" h="24pt"><value><exData contentType="text/html"><body xmlns="http://www.w3.org/1999/xhtml"><p><span xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xfa:embed="#reference"/></p></body></exData></value></draw>
+</pageArea></pageSet></subform></template><xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><reference>Header text</reference></xfa:data></xfa:datasets></xdp>"##;
+    let form = layout_xml(xml).unwrap();
+    assert!(form.pages[0].items.iter().any(|i| matches!(i,Item::Text(s) if s.text == "Header text")));
+}
+
+#[test]
+fn embedded_bmp_decodes_with_a_bounded_header() {
+    use ::image::ImageEncoder;
+    let mut bytes = Vec::new();
+    ::image::codecs::bmp::BmpEncoder::new(&mut bytes).write_image(&[255, 0, 0, 0, 255, 0], 2, 1, ::image::ExtendedColorType::Rgb8).unwrap();
+    assert_eq!(image::size(&bytes), Some((2, 1)));
+    assert_eq!(image::decode(&bytes).unwrap().samples, [255, 0, 0, 0, 255, 0]);
+    bytes[18..22].copy_from_slice(&i32::MAX.to_le_bytes());
+    assert_eq!(image::size(&bytes), None);
+    assert!(image::decode(&bytes).is_err());
+}
+
+#[test]
+fn remerge_preserves_unknown_packets_and_utf16_encoding() {
+    let xml = r#"<xdp><template><subform name="form"/></template><form xmlns="http://www.xfa.org/schema/xfa-form/2.8/"><subform name="form"/></form><unknown note="keep">é</unknown></xdp>"#;
+    for encoding in [Encoding::Utf8 { bom: false }, Encoding::Utf16Le { bom: true }, Encoding::Utf16Be { bom: true }] {
+        let mut doc = Document::open(Arc::new(shell_bytes(&encode_packet(xml, encoding)))).unwrap();
+        packets::clear_saved_form(&mut doc).unwrap();
+        let (text, kept_encoding) = decode_packet(&xfa_bytes(&doc)).unwrap();
+        assert_eq!(kept_encoding, encoding);
+        assert!(!text.contains("<form "));
+        assert!(text.contains("<unknown note=\"keep\">é</unknown>"));
+        assert!(template_of(&doc).is_ok());
+    }
+    let mut doc = Document::open(Arc::new(shell(xml))).unwrap();
+    let mut array = Vec::new();
+    for (name, text) in [
+        ("preamble", "<xdp>"),
+        ("template", "<template><subform/></template>"),
+        ("form", "<form/>"),
+        ("unknown", "<unknown>keep</unknown>"),
+        ("postamble", "</xdp>"),
+    ] {
+        let r = doc.add(Object::Stream(pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), text.as_bytes())));
+        array.extend([Object::String(pdfcraft_cos::PdfString::text(name)), Object::Ref(r)]);
+    }
+    let mut acro = pdfcraft_cos::Dict::new();
+    acro.set(b"XFA".to_vec(), Object::Array(array.clone()));
+    doc.update_dict(doc.root().unwrap(), |d| d.set(b"AcroForm".to_vec(), Object::Dict(acro))).unwrap();
+    packets::clear_saved_form(&mut doc).unwrap();
+    let root = doc.get(doc.root().unwrap());
+    let acro = root.as_dict().unwrap().get(b"AcroForm").unwrap().as_dict().unwrap();
+    let expected: Vec<_> = array.chunks(2).filter(|p| p[0].as_string().unwrap().to_text() != "form").flatten().cloned().collect();
+    assert_eq!(acro.get(b"XFA").unwrap().as_array().unwrap(), &expected);
+    assert!(template_of(&doc).is_ok());
+}
+
+#[test]
+fn a_saved_unbound_pdf417_field_is_drawn_as_bars() {
+    let xml = r#"<xdp><template><subform name="form"><field name="barcode" w="270pt" h="144pt"><bind match="none"/><ui><barcode type="pdf417" errorCorrectionLevel="5" moduleWidth="1pt" moduleHeight="2pt"/></ui></field></subform></template><form xmlns="http://www.xfa.org/schema/xfa-form/2.8/"><subform name="form"><field name="barcode"><value><text>TEST|Example|2030-01-02|</text></value></field></subform></form><xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><name>Example</name></form></xfa:data></xfa:datasets></xdp>"#;
+    let form = layout_xml(xml).unwrap();
+    assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+    let bars = form.pages.iter().flat_map(|p| &p.items).filter(|i| matches!(i, Item::Fill { color, .. } if *color == [0.0; 3])).count();
+    assert!(bars > 100, "saved payload should produce a PDF417 symbol, got {bars} bars");
+}
+
+#[test]
+fn subpoint_rounding_does_not_split_a_positioned_panel_across_pages() {
+    let xml = r#"<template><subform name="form" layout="tb"><pageSet><pageArea><medium short="300pt" long="140pt"/><contentArea x="20pt" y="20pt" w="260pt" h="100pt"/></pageArea></pageSet>
+<draw w="100pt" h="60pt"><value><text>Before</text></value></draw>
+<subform name="panel" w="260pt" h="100.23pt"><draw y="10pt" w="100pt" h="15pt"><value><text>Panel top</text></value></draw><draw y="70pt" w="100pt" h="15pt"><value><text>Panel bottom</text></value></draw></subform>
+<field name="signature" presence="invisible" w="0pt" h="0pt"><ui><signature/></ui></field>
+</subform></template>"#;
+    let form = layout_xml(xml).unwrap();
+    assert_eq!(form.pages.len(), 2);
+    assert!(!texts(&form.pages[0]).contains(&"Panel top".into()));
+    assert!(texts(&form.pages[1]).contains(&"Panel top".into()));
+    assert!(texts(&form.pages[1]).contains(&"Panel bottom".into()));
 }

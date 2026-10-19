@@ -8,7 +8,7 @@
 //! children, then its siblings, then each ancestor's children.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::{JsArray, JsProxy};
@@ -16,6 +16,10 @@ use boa_engine::property::Attribute;
 use boa_engine::{Context, JsObject, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
 
 use crate::{Limits, arg, as_number, error, function, platform, printd, printf, printx, refuse, s, text};
+
+mod choices;
+mod datasets;
+mod properties;
 
 /// What kind of template object a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +31,12 @@ pub enum XfaKind {
     ExclGroup,
     Draw,
     Area,
+    Script,
+    Variable,
+    Manifest,
+    Ref,
+    DataGroup,
+    DataValue,
 }
 
 impl XfaKind {
@@ -38,6 +48,12 @@ impl XfaKind {
             XfaKind::ExclGroup => "exclGroup",
             XfaKind::Draw => "draw",
             XfaKind::Area => "area",
+            XfaKind::Script => "script",
+            XfaKind::Variable => "text",
+            XfaKind::Manifest => "manifest",
+            XfaKind::Ref => "ref",
+            XfaKind::DataGroup => "dataGroup",
+            XfaKind::DataValue => "dataValue",
         }
     }
 }
@@ -64,6 +80,7 @@ pub struct XfaNode {
     /// This instance's index among its same-named siblings.
     pub index: usize,
     pub children: Vec<XfaNode>,
+    pub properties: BTreeMap<String, String>,
 }
 
 /// The event a script runs for.
@@ -84,6 +101,9 @@ pub struct XfaDoc {
     /// The current page, 0-based.
     pub page: usize,
     pub page_count: usize,
+    pub dialog_answers: Vec<i32>,
+    /// The datasets packet, including auxiliary data sources.
+    pub datasets_xml: String,
 }
 
 /// Something a script changed or asked for.
@@ -91,6 +111,11 @@ pub struct XfaDoc {
 pub enum XfaEffect {
     SetValue {
         som: String,
+        value: String,
+    },
+    SetProperty {
+        som: String,
+        path: String,
         value: String,
     },
     SetPresence {
@@ -112,6 +137,13 @@ pub enum XfaEffect {
     MessageBox(String),
     /// `xfa.host.resetData()`: the named fields, or every field when empty.
     ResetData(Vec<String>),
+    RemoveData(String),
+    LoadDataXml {
+        som: String,
+        xml: String,
+        ignore_root: bool,
+        overwrite: bool,
+    },
     Print,
     SaveAs,
     LaunchUrl(String),
@@ -119,7 +151,9 @@ pub enum XfaEffect {
     Beep,
     /// `xfa.form.recalculate(true)`.
     Recalculate,
-    /// `xfa.form.remerge()`, `xfa.layout.relayout()`.
+    /// `xfa.form.remerge()`: rebuild instances from the template and current data.
+    Remerge,
+    /// `xfa.layout.relayout()`.
     Relayout,
 }
 
@@ -140,6 +174,8 @@ pub struct XfaOutcome {
     /// The script ran past its time limit and was left running on its own thread (the engine
     /// can't interrupt it): the caller should run no more of this form's scripts.
     pub abandoned: bool,
+    pub confirmation: Option<crate::Request>,
+    pub answered_dialogs: usize,
 }
 
 /// Most nodes a snapshot may hold.
@@ -203,6 +239,7 @@ pub(crate) struct HNode {
     pub(crate) index: usize,
     pub(crate) parent: Option<usize>,
     pub(crate) children: Vec<usize>,
+    pub(crate) properties: BTreeMap<String, String>,
     /// Removed by `removeInstance`: skipped everywhere.
     pub(crate) gone: bool,
 }
@@ -227,6 +264,8 @@ pub(crate) struct XHost {
     clipped_values: usize,
     dropped_alerts: usize,
     dropped_console: usize,
+    confirmations: usize,
+    confirmation: Option<crate::Request>,
 }
 
 impl XHost {
@@ -236,11 +275,20 @@ impl XHost {
         let form = XfaNode { name: "form".into(), kind: Some(XfaKind::Form), children: vec![root], ..Default::default() };
         let mut nodes = Vec::new();
         flatten(&form, None, &mut nodes, 0);
+        let mut console = Vec::new();
+        if !doc.datasets_xml.is_empty() {
+            match datasets::parse(&doc.datasets_xml) {
+                Ok(data) => {
+                    flatten(&data, None, &mut nodes, 0);
+                }
+                Err(why) => console.push(format!("XFA data source: {why}")),
+            }
+        }
         let current = nodes.iter().position(|n| n.som == target && n.kind != XfaKind::Form).unwrap_or(1.min(nodes.len().saturating_sub(1)));
         XHost {
             nodes,
             effects: Vec::new(),
-            console: Vec::new(),
+            console,
             doc: doc.clone(),
             added: 0,
             current,
@@ -251,6 +299,8 @@ impl XHost {
             clipped_values: 0,
             dropped_alerts: 0,
             dropped_console: 0,
+            confirmations: 0,
+            confirmation: None,
         }
     }
 
@@ -273,6 +323,7 @@ impl XHost {
             XfaEffect::SetValue { som, .. } => Some((0u8, som.clone())),
             XfaEffect::SetPresence { som, .. } => Some((1, som.clone())),
             XfaEffect::SetAccess { som, .. } => Some((2, som.clone())),
+            XfaEffect::SetProperty { som, path, .. } => Some((3, format!("{som}|{path}"))),
             _ => None,
         };
         if let Some(key) = key {
@@ -337,9 +388,24 @@ impl XHost {
     /// Give node `i` the value `text` when it is a field or exclusion group (nothing else
     /// holds a value; writing one into a subform would put text where another viewer expects
     /// a data group). Returns whether it was.
-    pub(crate) fn set_value(&mut self, i: usize, text: String) -> bool {
+    pub(crate) fn set_value(&mut self, mut i: usize, mut text: String) -> bool {
+        // A radio child selects its exclusion group; it does not introduce a child
+        // datasets element. Clearing an unselected child must not clear its sibling.
+        if let Some(n) = self.nodes.get(i)
+            && let Some(parent) = n.parent.and_then(|p| self.nodes.get(p).map(|g| (p, g)))
+            && parent.1.kind == XfaKind::ExclGroup
+        {
+            let on = n.properties.get("$onValue").cloned().unwrap_or_default();
+            if text != on || on.is_empty() {
+                if parent.1.value != on {
+                    return true;
+                }
+                text.clear();
+            }
+            i = parent.0;
+        }
         let Some(n) = self.nodes.get_mut(i) else { return false };
-        if n.gone || !matches!(n.kind, XfaKind::Field | XfaKind::ExclGroup) {
+        if n.gone || !matches!(n.kind, XfaKind::Field | XfaKind::ExclGroup | XfaKind::Variable | XfaKind::DataValue) {
             return false;
         }
         // Cut here, not only in the effect: later reads in the script see what is saved, and
@@ -347,10 +413,25 @@ impl XHost {
         let (text, cut) = clip_value(text);
         n.value = text.clone();
         let som = n.som.clone();
+        let kind = n.kind;
+        let children = if kind == XfaKind::ExclGroup { n.children.clone() } else { Vec::new() };
+        // Form and data DOM reads within one event must observe the same answer.
+        if let Some(data) = bound_data(self, i).and_then(|d| self.nodes.get_mut(d)) {
+            data.value = text.clone();
+        }
+        for child in children {
+            if let Some(c) = self.nodes.get_mut(child) {
+                c.value = if c.properties.get("$onValue") == Some(&text) { text.clone() } else { String::new() };
+            }
+        }
         if cut {
             self.clipped_values += 1;
         }
-        self.push(XfaEffect::SetValue { som, value: text });
+        if kind == XfaKind::Variable {
+            self.push(XfaEffect::SetProperty { som, path: "$value".into(), value: text });
+        } else {
+            self.push(XfaEffect::SetValue { som, value: text });
+        }
         true
     }
 }
@@ -380,6 +461,7 @@ fn flatten(n: &XfaNode, parent: Option<usize>, out: &mut Vec<HNode>, depth: usiz
         index: n.index,
         parent,
         children: Vec::new(),
+        properties: n.properties.clone(),
         gone: false,
     });
     let mut kids = Vec::new();
@@ -410,9 +492,46 @@ fn node_index(target: &JsValue, ctx: &mut Context) -> JsResult<usize> {
 
 /// A Proxy standing for node `idx`.
 fn node_object(ctx: &mut Context, idx: usize) -> JsResult<JsValue> {
+    if host(ctx)?.borrow().nodes.get(idx).is_some_and(|n| n.kind == XfaKind::Script) {
+        return script_object(ctx, idx);
+    }
     let target = ObjectInitializer::new(ctx).property(JsString::from(IDX), JsValue::from(idx as f64), Attribute::READONLY).build();
     let proxy = JsProxy::builder(target).get(node_get).set(node_set).has(node_has).build(ctx)?;
     Ok(proxy.into())
+}
+
+/// Script objects are evaluated lazily, once in this event context. A lexical getter
+/// retains their private declarations without exporting them into the global namespace.
+fn script_object(ctx: &mut Context, idx: usize) -> JsResult<JsValue> {
+    let target = ObjectInitializer::new(ctx).property(JsString::from(IDX), JsValue::from(idx as f64), Attribute::READONLY).build();
+    Ok(JsProxy::builder(target).get(script_get).build(ctx)?.into())
+}
+
+fn script_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let idx = node_index(&arg(args, 0), ctx)?;
+    if arg(args, 1).as_symbol().is_some() {
+        return Ok(JsValue::undefined());
+    }
+    let key = text(&arg(args, 1), ctx)?;
+    if key == "value" {
+        return Ok(s(&host(ctx)?.borrow().nodes.get(idx).map(|n| n.value.clone()).unwrap_or_default()));
+    }
+    if !is_identifier(&key) {
+        return Ok(JsValue::undefined());
+    }
+    let cache_key = JsString::from(format!("__xfa_module_{idx}"));
+    let global = ctx.global_object();
+    let mut getter = global.get(cache_key.clone(), ctx)?;
+    if getter.is_undefined() {
+        let source = host(ctx)?.borrow().nodes.get(idx).map(|n| n.value.clone()).unwrap_or_default();
+        if let Some(why) = refuse(&source) {
+            return Err(error(&why));
+        }
+        ctx.register_global_property(js_string!("__xfa_module_source"), s(&source), Attribute::CONFIGURABLE)?;
+        getter = ctx.eval(Source::from_bytes(b"(function () { eval(__xfa_module_source); return function (name) { return eval(name); }; })()"))?;
+        global.set(cache_key, getter.clone(), true, ctx)?;
+    }
+    getter.as_callable().ok_or_else(|| error("invalid XFA script object"))?.call(&JsValue::undefined(), &[s(&key)], ctx)
 }
 
 /// An object that takes any property read or write without complaint (`this.border.fill…`,
@@ -617,6 +736,7 @@ fn clone_subtree(h: &mut XHost, src: usize, parent: Option<usize>, depth: usize)
                 index: n.index,
                 parent,
                 children: Vec::new(),
+                properties: n.properties.clone(),
                 gone: false,
             },
             n.children.clone(),
@@ -727,18 +847,49 @@ impl XHost {
     }
 }
 
+/// Follow a template binding without evaluating its contents as a SOM expression.
+fn bound_data(h: &XHost, idx: usize) -> Option<usize> {
+    let path = h.nodes.get(idx)?.properties.get("$dataPath")?;
+    if path.len() > 65_536 {
+        return None;
+    }
+    let path: Vec<(String, usize)> = serde_json::from_str(path).ok()?;
+    if path.is_empty() || path.len() > MAX_DEPTH {
+        return None;
+    }
+    let datasets = h.nodes.iter().position(|n| n.som == "xfa.datasets" && !n.gone)?;
+    let mut at = child_named(h, datasets, "data")?;
+    for (name, index) in path {
+        at = *instances(h, at, &name).get(index)?;
+    }
+    Some(at)
+}
+
 /// Resolve a SOM expression from node `from`: `$`, `$form`, `$record`, `$host`, `xfa.form…`,
 /// `parent`, `..name` (descendant search), `name[n]`, `name[*]`, `_name`.
 pub(crate) fn resolve_som(h: &XHost, from: usize, expr: &str) -> Vec<usize> {
-    let expr = expr.trim();
+    let normalized = expr.trim().replace("xfa[0].form[0]", "xfa.form").replace("xfa[0].datasets[0].data[0]", "xfa.datasets.data");
+    let expr = normalized.as_str();
     if expr.is_empty() {
         return vec![from];
     }
     let root = 0usize;
     let mut cur: Vec<usize> = vec![from];
     let mut rest = expr;
-    let starts =
-        [("$form", root), ("xfa.form", root), ("$record", root), ("xfa.datasets.data", root), ("xfa.record", root), ("$", from), ("this", from)];
+    let datasets = h.nodes.iter().position(|n| n.som == "xfa.datasets");
+    let data = datasets.and_then(|i| child_named(h, i, "data")).unwrap_or(root);
+    let record = h.nodes.get(data).and_then(|n| n.children.first()).copied().unwrap_or(root);
+    let starts = [
+        ("xfa.datasets.data", data),
+        ("xfa.datasets", datasets.unwrap_or(root)),
+        ("$data", data),
+        ("$record", record),
+        ("xfa.record", record),
+        ("$form", root),
+        ("xfa.form", root),
+        ("$", from),
+        ("this", from),
+    ];
     for (prefix, at) in starts {
         if let Some(r) = rest.strip_prefix(prefix)
             && (r.is_empty() || r.starts_with('.') || r.starts_with('['))
@@ -773,6 +924,9 @@ pub(crate) fn resolve_som(h: &XHost, from: usize, expr: &str) -> Vec<usize> {
                     if let Some(p) = h.nodes.get(c).and_then(|n| n.parent) {
                         next.push(p);
                     }
+                }
+                "dataNode" if h.nodes.get(c).is_some_and(|n| matches!(n.kind, XfaKind::Field | XfaKind::ExclGroup | XfaKind::Subform)) => {
+                    next.extend(bound_data(h, c));
                 }
                 _ => {
                     let mut found: Vec<usize> = if descend { descendants_named(h, c, name, 0) } else { instances(h, c, name) };
@@ -852,7 +1006,9 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let (name, som, kind, value, presence, access, index, parent, children) = snapshot;
     Ok(match key.as_str() {
         IDX => JsValue::from(idx as f64),
-        "rawValue" | "value" => host(ctx)?.borrow().nodes.get(idx).map_or(JsValue::null(), value_js),
+        "rawValue" | "value" => {
+            host(ctx)?.borrow().nodes.get(idx).map_or(JsValue::null(), |n| if n.kind == XfaKind::Variable { s(&n.value) } else { value_js(n) })
+        }
         "formattedValue" => s(&value),
         "name" => s(&name),
         "somExpression" => s(&som),
@@ -861,11 +1017,27 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         "presence" => s(&presence),
         "access" => s(&access),
         "isNull" => JsValue::from(value.is_empty()),
-        "mandatory" => s("disabled"),
+        "selectedIndex" => JsValue::from(choices::items(ctx, idx).iter().position(|(saved, _)| saved == &value).map_or(-1, |i| i as i32)),
+        "numItems" => JsValue::from(choices::items(ctx, idx).len() as f64),
+        "clearItems" | "addItem" | "deleteItem" | "getDisplayItem" | "getSaveItem" | "boundItem" => choices::method(ctx, idx, &key)?,
+        "mandatory" => s(&properties::value(ctx, idx, "validate.nullTest")),
+        "validationMessage" | "formatMessage" | "mandatoryMessage" => s(&properties::value(ctx, idx, &key)),
+        "ui" | "border" | "validate" | "assist" | "caption" => properties::object(ctx, idx, &key)?,
         "parent" => match parent {
             Some(p) => node_object(ctx, p)?,
             None => JsValue::null(),
         },
+        "dataNode" if matches!(kind, XfaKind::Field | XfaKind::ExclGroup | XfaKind::Subform) => {
+            let data = bound_data(&host(ctx)?.borrow(), idx);
+            match data {
+                Some(i) => node_object(ctx, i)?,
+                None => JsValue::null(),
+            }
+        }
+        "createNode" if matches!(kind, XfaKind::DataGroup | XfaKind::DataValue) => datasets::method(ctx, idx, "createNode")?,
+        "loadXML" | "saveXML" if matches!(kind, XfaKind::DataGroup | XfaKind::DataValue) => datasets::method(ctx, idx, &key)?,
+        "getDeltas" => function(ctx, NativeFunction::from_fn_ptr(restored_deltas)).into(),
+        "nodes" if matches!(kind, XfaKind::DataGroup | XfaKind::DataValue) => datasets::children(ctx, idx)?,
         "nodes" => {
             let live: Vec<usize> = {
                 let h = host(ctx)?.borrow();
@@ -884,13 +1056,13 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
             Some(p) => instance_manager(ctx, p, &name)?,
             None => JsValue::undefined(),
         },
-        "resolveNode" => resolver(ctx, idx, false)?,
-        "resolveNodes" => resolver(ctx, idx, true)?,
+        "resolveNode" => resolver(ctx, idx, false, false)?,
+        "resolveNodes" => resolver(ctx, idx, true, false)?,
         "recalculate" => function(ctx, NativeFunction::from_fn_ptr(recalculate)).into(),
-        "remerge" => function(ctx, NativeFunction::from_fn_ptr(relayout)).into(),
+        "remerge" => function(ctx, NativeFunction::from_fn_ptr(remerge)).into(),
+        "execEvent" => exec_event_method(ctx, idx)?,
         "getAttribute"
         | "setAttribute"
-        | "execEvent"
         | "execInitialize"
         | "execCalculate"
         | "execValidate"
@@ -902,11 +1074,15 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         | "clone" => function(ctx, NativeFunction::from_fn_ptr(noop)).into(),
         "toString" | "valueOf" | "toJSON" => function(ctx, NativeFunction::from_fn_ptr(node_to_string)).into(),
         "length" => JsValue::undefined(),
-        "border" | "ui" | "font" | "caption" | "fillColor" | "borderColor" | "fontColor" | "margin" | "para" | "assist" | "validate" | "format"
-        | "items" | "bind" | "keep" | "h" | "w" | "x" | "y" | "minH" | "maxH" | "minW" | "maxW" | "layout" | "model" | "oneOfChild" | "locale"
-        | "relevant" | "colSpan" | "dataNode" | "defaultValue" | "editValue" | "selectedIndex" | "event" | "calculate" | "traversal" | "extras"
-        | "desc" => sink(ctx)?,
+        "font" | "fillColor" | "borderColor" | "fontColor" | "margin" | "para" | "format" | "items" | "bind" | "keep" | "h" | "w" | "x" | "y"
+        | "minH" | "maxH" | "minW" | "maxW" | "layout" | "model" | "oneOfChild" | "locale" | "relevant" | "colSpan" | "defaultValue"
+        | "editValue" | "event" | "calculate" | "traversal" | "extras" | "desc" => sink(ctx)?,
         other => {
+            if matches!(kind, XfaKind::DataGroup | XfaKind::DataValue)
+                && host(ctx)?.borrow().nodes.get(idx).is_some_and(|n| n.properties.contains_key(&format!("@{other}.value")))
+            {
+                return properties::object(ctx, idx, &format!("@{other}"));
+            }
             if let Some(child) = other.strip_prefix('_') {
                 let exists = child_named(&host(ctx)?.borrow(), idx, child).is_some();
                 return if exists { instance_manager(ctx, idx, child) } else { Ok(JsValue::undefined()) };
@@ -933,9 +1109,20 @@ fn node_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let Some(n) = h.nodes.get(idx) else { return Ok(JsValue::from(true)) };
     let som = n.som.clone();
     match key.as_str() {
+        "selectedIndex" => {
+            drop(h);
+            let list = choices::items(ctx, idx);
+            let index = value.parse::<i64>().unwrap_or(-1);
+            let selected = usize::try_from(index).ok().and_then(|i| list.get(i)).map(|(saved, _)| saved.clone()).unwrap_or_default();
+            host(ctx)?.borrow_mut().set_value(idx, selected);
+        }
         "rawValue" | "value" | "formattedValue" => {
             // Not a field: the property doesn't exist, as in Acrobat, and nothing is recorded.
             h.set_value(idx, value);
+        }
+        "mandatory" => {
+            drop(h);
+            properties::assign(ctx, idx, "validate.nullTest".into(), value)?;
         }
         "presence" => {
             let p = match value.as_str() {
@@ -967,20 +1154,67 @@ fn node_to_string(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<
     Ok(s(&host(ctx)?.borrow().nodes.get(idx).map(|n| n.value.clone()).unwrap_or_default()))
 }
 
+fn exec_event_method(ctx: &mut Context, idx: usize) -> JsResult<JsValue> {
+    let capture = ObjectInitializer::new(ctx).property(JsString::from(IDX), idx as f64, Attribute::READONLY).build();
+    fn exec(_: &JsValue, args: &[JsValue], capture: &JsObject, ctx: &mut Context) -> JsResult<JsValue> {
+        let idx = node_index(&capture.clone().into(), ctx)?;
+        let event = text(&arg(args, 0), ctx)?;
+        let source = host(ctx)?.borrow().nodes.get(idx).and_then(|n| n.properties.get(&format!("$event.{event}")).cloned());
+        let Some(source) = source else {
+            return Ok(JsValue::from(true));
+        };
+        if let Some(why) = refuse(&source) {
+            return Err(error(&why));
+        }
+        let target = node_object(ctx, idx)?;
+        let bindings = scope_bindings(ctx, idx)?;
+        let mut scope = ObjectInitializer::new(ctx);
+        for (name, value) in bindings {
+            scope.property(JsString::from(name), value, Attribute::all());
+        }
+        let scope = scope.build();
+        // Each nested handler gets its own lexical field scope. This also keeps the caller's
+        // sibling bindings intact after it returns, including when the handler throws.
+        let callable = ctx
+            .eval(Source::from_bytes(b"(function (__xfa_event_source, __xfa_scope) { with (__xfa_scope) { return eval(__xfa_event_source); } })"))?;
+        let function = callable.as_callable().ok_or_else(|| error("invalid XFA event handler"))?;
+        let previous = host(ctx)?.borrow().current;
+        host(ctx)?.borrow_mut().current = idx;
+        let result = function.call(&target, &[s(&source), scope.into()], ctx);
+        host(ctx)?.borrow_mut().current = previous;
+        result
+    }
+    Ok(function(ctx, NativeFunction::from_copy_closure_with_captures(exec, capture)).into())
+}
+
+fn restored_deltas(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // The engine restores the saved form packet before initializing scripts, so there are
+    // no deferred deltas for a document's docReady handler to restore a second time.
+    list_object(ctx, &[])
+}
+
 fn noop(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
 
 /// `resolveNode(som)` / `resolveNodes(som)` bound to node `from`.
-fn resolver(ctx: &mut Context, from: usize, many: bool) -> JsResult<JsValue> {
+fn resolver(ctx: &mut Context, from: usize, many: bool, current: bool) -> JsResult<JsValue> {
     let key = ObjectInitializer::new(ctx)
         .property(js_string!("from"), JsValue::from(from as f64), Attribute::READONLY)
         .property(js_string!("many"), JsValue::from(many), Attribute::READONLY)
+        .property(js_string!("current"), JsValue::from(current), Attribute::READONLY)
         .build();
     fn resolve(_: &JsValue, args: &[JsValue], key: &JsObject, ctx: &mut Context) -> JsResult<JsValue> {
-        let from = key.get(js_string!("from"), ctx)?.to_number(ctx)? as usize;
+        let from = if key.get(js_string!("current"), ctx)?.to_boolean() {
+            host(ctx)?.borrow().current
+        } else {
+            key.get(js_string!("from"), ctx)?.to_number(ctx)? as usize
+        };
         let many = key.get(js_string!("many"), ctx)?.to_boolean();
         let expr = text(&arg(args, 0), ctx)?;
+        if !many && matches!(expr.split('.').next(), Some("ui" | "caption" | "border" | "validate" | "assist")) {
+            return properties::object(ctx, from, &expr.replace('#', ""));
+        }
         let found = resolve_som(&host(ctx)?.borrow(), from, &expr);
         if many {
             return list_object(ctx, &found);
@@ -1002,6 +1236,26 @@ fn effect(ctx: &mut Context, e: XfaEffect) -> JsResult<()> {
 
 fn message_box(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let m = clip(text(&arg(args, 0), ctx)?);
+    let buttons = arg(args, 3).to_number(ctx).unwrap_or(0.0);
+    if (1.0..=3.0).contains(&buttons) {
+        let title = text(&arg(args, 1), ctx)?;
+        let mut h = host(ctx)?.borrow_mut();
+        let answer = h.doc.dialog_answers.get(h.confirmations).copied();
+        h.confirmations = h.confirmations.saturating_add(1);
+        if let Some(answer) = answer {
+            let allowed = match buttons as i32 {
+                1 => matches!(answer, 1 | 2),
+                2 => matches!(answer, 3 | 4),
+                _ => matches!(answer, 2..=4),
+            };
+            if !allowed {
+                return Err(error("the dialog answer is not one of this message box's buttons"));
+            }
+            return Ok(JsValue::from(answer));
+        }
+        h.confirmation = Some(crate::Request::Confirm { message: m, title, buttons: buttons as i32 });
+        return Err(error("XFA confirmation needs an answer"));
+    }
     effect(ctx, XfaEffect::MessageBox(m))?;
     Ok(JsValue::from(1.0))
 }
@@ -1010,6 +1264,16 @@ fn reset_data(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     let list = text(&arg(args, 0), ctx)?;
     let names: Vec<String> = list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
     effect(ctx, XfaEffect::ResetData(names))?;
+    Ok(JsValue::undefined())
+}
+
+fn remove_data(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let idx = node_index(&arg(args, 0), ctx)?;
+    let som = host(ctx)?.borrow().nodes.get(idx).map(|n| n.som.clone()).unwrap_or_default();
+    if som.is_empty() {
+        return Err(error("cannot remove the datasets root"));
+    }
+    effect(ctx, XfaEffect::RemoveData(som))?;
     Ok(JsValue::undefined())
 }
 
@@ -1062,8 +1326,19 @@ fn recalculate(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(JsValue::undefined())
 }
 
+fn remerge(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    effect(ctx, XfaEffect::Remerge)?;
+    Ok(JsValue::undefined())
+}
+
 fn relayout(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     effect(ctx, XfaEffect::Relayout)?;
+    Ok(JsValue::undefined())
+}
+
+fn log_message(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let message = text(&arg(args, 1), ctx)?;
+    host(ctx)?.borrow_mut().print(message);
     Ok(JsValue::undefined())
 }
 
@@ -1095,7 +1370,7 @@ fn zero(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
 
 fn xfa_resolve(ctx: &mut Context, many: bool) -> JsResult<JsValue> {
     let current = host(ctx)?.borrow().current;
-    resolver(ctx, current, many)
+    resolver(ctx, current, many, true)
 }
 
 fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) -> JsResult<()> {
@@ -1160,22 +1435,37 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         .function(NativeFunction::from_fn_ptr(noop), js_string!("emit"), 0)
         .function(NativeFunction::from_fn_ptr(noop), js_string!("reset"), 0)
         .build();
-    let datasets = ObjectInitializer::new(ctx).property(js_string!("data"), form.clone(), rw).build();
+    let data_index = host(ctx)?.borrow().nodes.iter().position(|n| n.som == "xfa.datasets");
+    let datasets = match data_index {
+        Some(i) => node_object(ctx, i)?,
+        None => {
+            let data_nodes = ObjectInitializer::new(ctx).function(NativeFunction::from_fn_ptr(remove_data), js_string!("remove"), 1).build();
+            let data = ObjectInitializer::new(ctx).property(js_string!("nodes"), data_nodes, rw).build();
+            ObjectInitializer::new(ctx).property(js_string!("data"), data, rw).build().into()
+        }
+    };
+    let data = match data_index.and_then(|i| child_named(&host(ctx).ok()?.borrow(), i, "data")) {
+        Some(i) => node_object(ctx, i)?,
+        None => JsValue::null(),
+    };
     let template = sink(ctx)?;
     let resolve_one = xfa_resolve(ctx, false)?;
     let resolve_many = xfa_resolve(ctx, true)?;
+    let log = ObjectInitializer::new(ctx).function(NativeFunction::from_fn_ptr(log_message), js_string!("message"), 2).build();
     let xfa = ObjectInitializer::new(ctx)
+        .property(js_string!("log"), log, rw)
         .property(js_string!("form"), form.clone(), rw)
         .property(js_string!("host"), host_obj, rw)
         .property(js_string!("layout"), layout, rw)
         .property(js_string!("event"), ev.clone(), rw)
         .property(js_string!("datasets"), datasets, rw)
+        .property(js_string!("data"), data, rw)
         .property(js_string!("record"), form.clone(), rw)
         .property(js_string!("template"), template, rw)
         .property(js_string!("resolveNode"), resolve_one, rw)
         .property(js_string!("resolveNodes"), resolve_many, rw)
         .function(NativeFunction::from_fn_ptr(recalculate), js_string!("recalculate"), 1)
-        .function(NativeFunction::from_fn_ptr(relayout), js_string!("remerge"), 0)
+        .function(NativeFunction::from_fn_ptr(remerge), js_string!("remerge"), 0)
         .build();
     ctx.register_global_property(js_string!("xfa"), xfa, rw)?;
     ctx.register_global_property(js_string!("event"), ev, rw)?;
@@ -1210,6 +1500,13 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         .function(NativeFunction::from_fn_ptr(printx), js_string!("printx"), 2)
         .build();
     ctx.register_global_property(js_string!("util"), util, rw)?;
+    for (name, value) in scope_bindings(ctx, current)? {
+        ctx.register_global_property(JsString::from(name), value, rw)?;
+    }
+    Ok(())
+}
+
+fn scope_bindings(ctx: &mut Context, current: usize) -> JsResult<Vec<(String, JsValue)>> {
     // Unqualified names: the current node's children, its siblings, then each ancestor's
     // children, the nearest first. Instance managers as `_name`.
     let scopes: Vec<usize> = {
@@ -1233,10 +1530,11 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         "event",
         "app",
         "console",
-        "util",
         "this",
         "__xfa_this",
         "__xfa_src",
+        "__xfa_scope",
+        "__xfa_event_source",
         "eval",
         "arguments",
         "globalThis",
@@ -1281,6 +1579,7 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         "DataView",
         "Intl",
     ];
+    let mut bindings = Vec::new();
     let mut defined: Vec<String> = RESERVED.iter().map(|s| s.to_string()).collect();
     for scope in scopes {
         let kids: Vec<(usize, String, bool)> = {
@@ -1295,15 +1594,15 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
                 continue;
             }
             let obj = node_object(ctx, c)?;
-            ctx.register_global_property(JsString::from(name.as_str()), obj, rw)?;
+            bindings.push((name.clone(), obj));
             if repeatable {
                 let im = instance_manager(ctx, scope, &name)?;
-                ctx.register_global_property(JsString::from(format!("_{name}").as_str()), im, rw)?;
+                bindings.push((format!("_{name}"), im));
             }
             defined.push(name);
         }
     }
-    Ok(())
+    Ok(bindings)
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -1489,9 +1788,65 @@ pub(crate) fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNo
     if let Some(h) = ctx.remove_data::<Shared>() {
         let h = h.into_inner();
         out.notes = h.notes();
+        out.answered_dialogs = h.confirmations.min(h.doc.dialog_answers.len());
+        out.confirmation = h.confirmation;
         out.effects = h.effects;
         out.console = h.console;
     }
     clip_result(&mut out);
     out
+}
+
+#[cfg(test)]
+mod script_library_tests {
+    use super::*;
+
+    #[test]
+    fn script_object_value_returns_xml_without_executing_it() {
+        let xml = format!("<choices>{}</choices>", "<entry>one</entry>".repeat(20_000));
+        let root = XfaNode {
+            name: "form".into(),
+            som: "form[0]".into(),
+            kind: Some(XfaKind::Subform),
+            children: vec![XfaNode { name: "choices".into(), kind: Some(XfaKind::Script), value: xml.clone(), ..Default::default() }],
+            ..Default::default()
+        };
+        let out = run_xfa(
+            "xfa.host.messageBox(choices.value.length)",
+            &XfaEvent { target: "form[0]".into(), ..Default::default() },
+            &XfaDoc::default(),
+            &root,
+            Limits::default(),
+        );
+        assert!(out.error.is_none(), "{out:?}");
+        assert!(out.effects.contains(&XfaEffect::MessageBox(xml.len().to_string())));
+    }
+
+    #[test]
+    fn named_script_objects_share_variables_and_write_validation_borders() {
+        let root = XfaNode {
+            name: "form".into(), som: "form[0]".into(), kind: Some(XfaKind::Subform),
+            children: vec![
+                XfaNode { name: "helpers".into(), kind: Some(XfaKind::Script),
+                    value: "var limit = 12; function valid(field) { if (Number(field.rawValue) > limit) { field.ui.oneOfChild.border.edge.color.value = '255,0,0'; state.value = 'invalid'; return false; } return true; }".into(), ..Default::default() },
+                XfaNode { name: "state".into(), som: "form[0].#variables[0].state[0]".into(), kind: Some(XfaKind::Variable), value: "valid".into(), ..Default::default() },
+                XfaNode { name: "month".into(), som: "form[0].month[0]".into(), kind: Some(XfaKind::Field), value: "19".into(),
+                    properties: BTreeMap::from([("uiType".into(), "textEdit".into())]), ..Default::default() },
+            ], ..Default::default()
+        };
+        let event = XfaEvent { activity: "validate".into(), target: "form[0].month[0]".into(), ..Default::default() };
+        let out = run_xfa("helpers.valid(this)", &event, &XfaDoc::default(), &root, Limits::default());
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.result_bool, Some(false));
+        assert!(out.effects.contains(&XfaEffect::SetProperty {
+            som: "form[0].month[0]".into(),
+            path: "ui.textEdit.border.edge.color.value".into(),
+            value: "255,0,0".into()
+        }));
+        assert!(out.effects.contains(&XfaEffect::SetProperty {
+            som: "form[0].#variables[0].state[0]".into(),
+            path: "$value".into(),
+            value: "invalid".into()
+        }));
+    }
 }

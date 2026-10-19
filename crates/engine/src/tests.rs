@@ -4651,9 +4651,10 @@ fn flattening_an_xfa_form_bakes_its_pages_and_takes_the_xfa_out() {
     assert_eq!(d.info.xfa, None, "no longer an XFA form: Adobe's viewers show the baked pages");
     assert!(d.xfa.is_none());
     let texts = page_texts(&s, id).join("\n");
-    for want in ["Japan", "typed here", "Country: JP", "12345"] {
+    for want in ["Japan", "typed here", "Country: JP"] {
         assert!(texts.contains(want), "{want} is page content now: {texts}");
     }
+    assert!(!texts.contains("12345"), "an unsupported barcode must not be flattened as misleading plain text");
     // Saved and reopened: a plain PDF, the same page content, nothing of the XFA left.
     let saved = s.save_bytes(id).unwrap();
     let cos = pdfcraft_cos::Document::open(saved.clone()).unwrap();

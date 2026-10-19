@@ -140,3 +140,62 @@ fn prepare_a_form_detects_fields_on_a_paper_form() {
     assert_eq!(names, ["Name", "Phone"]);
     assert_eq!(app.toast.clone().unwrap().0, "Detected 2 form fields");
 }
+
+#[test]
+fn xfa_clear_confirmation_cancel_accept_and_undo() {
+    let template = pdfcraft_xfa::fixtures::scripted_template().replace(
+        "xfa.host.messageBox(\"Hello \" + qty.rawValue);",
+        "qty.rawValue = 99; if (xfa.host.messageBox('Erase entries?', 'Clear form', 2, 1) == 1) { qty.rawValue = null; } else { qty.rawValue = 2; }",
+    );
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("synthetic.pdf", None, pdfcraft_xfa::fixtures::shell(&template)).unwrap();
+        app
+    });
+    h.run_steps(4);
+    let id = h.state().active_ids().unwrap().1;
+    h.state_mut().run_button_script(id, "hello", "");
+    h.run_steps(2);
+    h.get_by_label("Erase entries?");
+    assert_eq!(value(&h, "qty"), ["2"], "mutations preceding a prompt must remain provisional");
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert_eq!(value(&h, "qty"), ["2"]);
+    h.state_mut().run_button_script(id, "hello", "");
+    h.run_steps(2);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    assert!(value(&h, "qty").iter().all(String::is_empty));
+    h.state_mut().session.undo(id).unwrap();
+    assert_eq!(value(&h, "qty"), ["2"]);
+}
+
+#[test]
+fn xfa_change_event_advances_focus_after_the_last_date_digit() {
+    let template = r#"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">
+<pageSet><pageArea><medium short="300pt" long="400pt"/><contentArea x="20pt" y="20pt" w="260pt" h="360pt"/></pageArea></pageSet>
+<field name="year" w="100pt" h="24pt"><ui><textEdit/></ui><event activity="change"><script contentType="application/x-javascript">if (xfa.event.newText.length == 4) xfa.host.setFocus(month);</script></event></field>
+<field name="month" w="100pt" h="24pt"><ui><textEdit/></ui></field></subform></template>"#;
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("form.pdf", None, pdfcraft_xfa::fixtures::shell(template)).unwrap();
+        app
+    });
+    h.run_steps(4);
+    let id = h.state().active_ids().unwrap().1;
+    h.state_mut()
+        .handle_js(id, pdfcraft_engine::js::JsOutput { requests: vec![pdfcraft_engine::js::Request::Focus("year".into())], ..Default::default() });
+    h.run_steps(4);
+    h.event(egui::Event::Text("202".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().views[0].forms.focus.as_ref().unwrap().name, "year");
+    assert!(value(&h, "year").iter().all(String::is_empty));
+    h.event(egui::Event::Text("4".into()));
+    h.run_steps(3);
+    assert_eq!(h.state().views[0].forms.focus.as_ref().unwrap().name, "month");
+    assert_eq!(value(&h, "year"), ["2024"]);
+    assert!(h.state_mut().execute("edit.undo"));
+    assert!(value(&h, "year").iter().all(String::is_empty));
+}

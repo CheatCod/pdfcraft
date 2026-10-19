@@ -57,6 +57,8 @@ pub struct FormView {
     pub notice: Option<FormNotice>,
     /// A push button was clicked: (its field name, what it does).
     pub button: Option<(String, pdfcraft_engine::form_scripts::ButtonAction)>,
+    /// Text changed in the open editor: preview its XFA change event before committing.
+    pub(crate) draft_change: Option<(String, String)>,
 }
 
 /// A form message for the app to show, with document data kept separate so the visible
@@ -79,7 +81,7 @@ fn fillable(f: &FormField) -> bool {
     !f.read_only() && !matches!(f.kind, FormFieldKind::PushButton | FormFieldKind::Signature)
 }
 
-fn open_focus(f: &FormField, widget: usize) -> Focus {
+pub(crate) fn open_focus(f: &FormField, widget: usize) -> Focus {
     Focus {
         name: f.name.clone(),
         widget,
@@ -515,6 +517,9 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, f
                     laid_out = Some((out.galley, out.galley_pos));
                     out.response.response
                 });
+                if r.changed() {
+                    view.forms.draft_change = Some((fx.name.clone(), fx.text.clone()));
+                }
                 if let Some(press) = fx.press.take()
                     && let Some((galley, pos)) = laid_out
                     && let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id)

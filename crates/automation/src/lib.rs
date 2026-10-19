@@ -719,6 +719,7 @@ impl Automation {
             }
             "form_fields" => self.form_fields(&a)?,
             "form_fill" => self.form_fill(&a)?,
+            "form_change_preview" => self.form_change_preview(&a)?,
             "form_set_image" => {
                 let path = self.resolve(a.str("path")?, false)?;
                 let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
@@ -895,7 +896,15 @@ impl Automation {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let id = self.session.open(name, Some(path.to_string_lossy().into_owned()), Arc::new(bytes), a.opt_str("password")?).map_err(failed)?;
         let doc = self.session.get(id).ok_or_else(|| failed("the document vanished"))?;
-        Ok(summary(doc))
+        let mut result = summary(doc);
+        let output = self.session.take_js_output(id);
+        if !output.is_empty() {
+            result["alerts"] = json!(output.alerts);
+            result["errors"] = json!(output.errors);
+            result["console"] = json!(output.console);
+            result["requests"] = json!(output.requests.iter().map(a11y::request_json).collect::<Vec<_>>());
+        }
+        Ok(result)
     }
 
     fn doc_close(&mut self, a: &Args) -> Result<Value> {

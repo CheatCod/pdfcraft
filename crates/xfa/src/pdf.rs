@@ -241,7 +241,7 @@ fn signed_fields(doc: &Document, catalog: &Dict) -> HashMap<String, Signed> {
 
 impl Emitter<'_> {
     fn da(face: &Face) -> Vec<u8> {
-        format!("/{} {} Tf {} rg", face.resource_name(), n(face.size), rgb(face.color)).into_bytes()
+        format!("/{} {} Tf {} rg {} Tc", face.resource_name(), n(face.size), rgb(face.color), n(face.letter_spacing)).into_bytes()
     }
 
     fn widget(&mut self, w: &Widget, page: &Page, page_ref: ObjRef) -> Result<Option<ObjRef>, XfaError> {
@@ -284,6 +284,9 @@ impl Emitter<'_> {
                 }
                 if w.kind == WidgetKind::Password {
                     ff |= 1 << 13;
+                }
+                if let Some(digits) = w.number_digits {
+                    d.set(b"PCXfaNumberDigits".to_vec(), Object::Int(digits.min(16) as i64));
                 }
                 if let Some(m) = w.max_chars {
                     d.set(b"MaxLen".to_vec(), Object::Int(m.min(100_000) as i64));
@@ -399,6 +402,8 @@ impl Emitter<'_> {
                 d.set(b"PCItems".to_vec(), Object::Array(w.items.iter().map(|i| Object::String(PdfString::text(i))).collect()));
             }
             WidgetKind::Radio { group, on, .. } => {
+                // XFA checkButton defaults to a check mark even inside an exclusion group.
+                mk.set(b"CA".to_vec(), Object::String(PdfString::text("4")));
                 top_level = false;
                 let parent = match self.radio_groups.get(group) {
                     Some((p, _)) => *p,
@@ -539,7 +544,7 @@ impl Emitter<'_> {
                 d.set(b"Filter".to_vec(), Object::name("DCTDecode"));
                 Some(self.doc.add(Object::Stream(Stream::from_raw(d, data.to_vec()))))
             }
-            Some(crate::image::Kind::Png | crate::image::Kind::Gif) => {
+            Some(crate::image::Kind::Png | crate::image::Kind::Gif | crate::image::Kind::Tiff | crate::image::Kind::Bmp) => {
                 let img = match crate::image::decode(data) {
                     Ok(img) => img,
                     Err(why) => {
@@ -564,7 +569,7 @@ impl Emitter<'_> {
                 Some(self.doc.add(Object::Stream(Stream::flate(d, &img.samples))))
             }
             None => {
-                self.warnings.push(format!("a {what} image is not a JPEG, PNG or GIF and is left out"));
+                self.warnings.push(format!("a {what} image is not a JPEG, PNG, GIF, TIFF or BMP and is left out"));
                 None
             }
         }
@@ -613,7 +618,15 @@ impl Emitter<'_> {
                     let name = s.face.resource_name();
                     fonts.insert(name, s.face.family.base_font(s.face.bold, s.face.italic));
                     content.extend(
-                        format!("BT /{name} {} Tf {} rg 1 0 0 1 {} {} Tm ", n(s.face.size), rgb(s.face.color), n(s.x), n(h - s.baseline)).bytes(),
+                        format!(
+                            "BT /{name} {} Tf {} rg {} Tc 1 0 0 1 {} {} Tm ",
+                            n(s.face.size),
+                            rgb(s.face.color),
+                            n(s.face.letter_spacing),
+                            n(s.x),
+                            n(h - s.baseline)
+                        )
+                        .bytes(),
                     );
                     content.extend(literal(&win_ansi(&s.text)));
                     content.extend_from_slice(b" Tj ET\n");

@@ -184,6 +184,44 @@ impl Session {
     /// the console (no target). Field changes and `resetForm` are applied as one undoable step;
     /// everything else the script asked for is returned.
     pub fn run_javascript(&mut self, id: DocId, script: &str, target: Option<&str>) -> Result<Outcome, EditError> {
+        self.run_javascript_with_answers(id, script, target, &[])
+    }
+
+    /// Preview an XFA change event while typing, without changing values or the undo history.
+    /// A viewer commits the draft before following a returned focus request. Other script
+    /// mutations remain provisional and run again when the value is committed.
+    pub fn preview_form_change(&mut self, id: DocId, field: &str, text: &str) -> Result<JsOutput, EditError> {
+        if text.len() > 65_536 {
+            return Err(EditError::Invalid("a form draft must be at most 65536 bytes".into()));
+        }
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        let f = doc.form.iter().find(|f| f.name == field).ok_or_else(|| EditError::Invalid("unknown form field".into()))?;
+        if f.read_only() || self.js_off || doc.xfa_scripts_off() {
+            return Ok(JsOutput::default());
+        }
+        let Some(tpl) = doc.xfa_template.as_ref() else { return Ok(JsOutput::default()) };
+        let Some(editor) = &doc.editor else { return Ok(JsOutput::default()) };
+        let mut copy = editor.cos.clone();
+        let mut output = JsOutput::default();
+        let mut run = crate::xfa::XfaRun { page_count: doc.info.pages.len(), out: &mut output, datasets: None, ran_away: false };
+        crate::guard(|| crate::xfa::preview_change(&mut copy, tpl, field, text, &mut run))
+            .map_err(EditError::Invalid)?
+            .map_err(EditError::Invalid)?;
+        if run.ran_away
+            && let Some(doc) = self.docs.iter_mut().find(|d| d.id == id)
+        {
+            doc.xfa_template = None;
+            doc.xfa_scripts_off = true;
+        }
+        Ok(output)
+    }
+
+    /// Resume a form button after its confirmation dialog. Answers use XFA's return codes
+    /// (1 OK, 2 Cancel, 3 No, 4 Yes); the unanswered attempt never changes the document.
+    pub fn run_javascript_with_answers(&mut self, id: DocId, script: &str, target: Option<&str>, answers: &[i32]) -> Result<Outcome, EditError> {
+        if answers.len() > 100 || answers.iter().any(|a| !(1..=4).contains(a)) {
+            return Err(EditError::Invalid("dialog answers must contain at most 100 codes between 1 and 4".into()));
+        }
         if self.js_off {
             return Err(EditError::Invalid("JavaScript is turned off (Preferences ▸ JavaScript)".into()));
         }
@@ -194,7 +232,25 @@ impl Session {
             && let Some(tpl) = doc.xfa_template.clone()
             && let Some(som) = crate::xfa::clickable_som(&cos, &tpl, t)
         {
-            self.apply(id, Edit::XfaEvent { som, activity: "click".into() })?;
+            // Run on a copy first: a confirmation may follow arbitrary script mutations.
+            // None of those mutations are committed until every prompt has an answer.
+            let mut preview = cos.clone();
+            let mut output = JsOutput::default();
+            let mut run = crate::xfa::XfaRun { page_count: doc.info.pages.len(), out: &mut output, datasets: None, ran_away: false };
+            crate::guard(|| crate::xfa::on_event_with_answers(&mut preview, &tpl, &som, "click", answers, &mut run))
+                .map_err(EditError::Invalid)?
+                .map_err(EditError::Invalid)?;
+            if run.ran_away {
+                if let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) {
+                    doc.xfa_template = None;
+                    doc.xfa_scripts_off = true;
+                }
+                return Ok(Outcome { error: output.errors.first().cloned(), console: output.console, ..Default::default() });
+            }
+            if output.requests.iter().any(|r| matches!(r, Request::Confirm { .. })) {
+                return Ok(Outcome { requests: output.requests, ..Default::default() });
+            }
+            self.apply(id, Edit::XfaEvent { som, activity: "click".into(), dialog_answers: answers.to_vec() })?;
             let out = self.take_js_output(id);
             return Ok(Outcome {
                 rc: true,

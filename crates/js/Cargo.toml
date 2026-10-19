@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+roxmltree = "0.20"
+serde_json = { workspace = true }
 boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

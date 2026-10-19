@@ -117,6 +117,7 @@ pub struct Widget {
     pub h_align: HAlign,
     pub multiline: bool,
     pub max_chars: Option<usize>,
+    pub number_digits: Option<usize>,
     pub read_only: bool,
     pub border: WidgetBorder,
     /// The field's value: saved (bound) values for choice lists, newline-separated when several.
@@ -238,7 +239,7 @@ pub fn layout(tpl: &Template, data: Option<&DataNode>) -> Result<Form, XfaError>
     let mut values = HashMap::new();
     // One copy of the root for the whole layout: measurements are cached by node address.
     let root_node = Node::Subform(Box::new(tpl.root.clone()));
-    collect_values(std::slice::from_ref(&root_node), &mut values, 0);
+    collect_values(std::slice::from_ref(&root_node), &mut values, tpl, data, "", 0);
     let mut l = Layouter {
         tpl,
         data,
@@ -278,26 +279,36 @@ pub fn layout(tpl: &Template, data: Option<&DataNode>) -> Result<Form, XfaError>
     Ok(Form { pages: l.pages, fields: l.fields, warnings: l.warnings })
 }
 
-fn collect_values(nodes: &[Node], out: &mut HashMap<String, String>, depth: usize) {
+fn collect_values(nodes: &[Node], out: &mut HashMap<String, String>, tpl: &Template, data: Option<&DataNode>, parent: &str, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
-    for n in nodes {
+    let siblings = SomIndices::of(nodes);
+    for (i, n) in nodes.iter().enumerate() {
+        let som = match &n.common().name {
+            Some(name) if parent.is_empty() => format!("{name}[{}]", siblings.at(i)),
+            Some(name) => format!("{parent}.{name}[{}]", siblings.at(i)),
+            None => parent.to_string(),
+        };
         match n {
             Node::Field(f) => {
                 if let Some(id) = &f.common.id {
-                    out.insert(id.clone(), f.value.plain().unwrap_or_default());
+                    let path = data_path(tpl, &som);
+                    let value =
+                        data.filter(|_| !path.is_empty()).and_then(|d| d.value_at(&path)).unwrap_or_else(|| f.value.plain().unwrap_or_default());
+                    out.insert(id.clone(), f.saved_value(&value));
                 }
             }
             Node::Subform(s) => {
-                collect_values(&s.children, out, depth + 1);
+                collect_values(&s.children, out, tpl, data, &som, depth + 1);
                 if let Some(ps) = &s.page_set {
-                    for a in &ps.areas {
-                        collect_values(&a.items, out, depth + 1);
+                    for (i, a) in ps.areas.iter().enumerate() {
+                        let area = a.name.as_ref().map(|n| format!("{n}[0]")).unwrap_or_else(|| format!("#pageArea[{i}]"));
+                        collect_values(&a.items, out, tpl, data, &area, depth + 1);
                     }
                 }
             }
-            Node::Area(a) => collect_values(&a.children, out, depth + 1),
+            Node::Area(a) => collect_values(&a.children, out, tpl, data, &som, depth + 1),
             Node::ExclGroup(_) | Node::Draw(_) => {}
         }
     }
@@ -591,8 +602,11 @@ impl Layouter<'_> {
     /// in the next when it fits there, and across as many as it takes when it is taller than a
     /// content area (a positioned or fixed-height subform holding more than a page).
     fn flow_block(&mut self, node: &Node, x: f64, (w, h): (f64, f64), ctx: &Ctx, depth: usize, sib: usize) -> Result<(), XfaError> {
+        // Designer measurements can differ by a fraction of a point after unit
+        // conversion. Keep an otherwise page-sized positioned panel together.
+        const FIT_TOLERANCE: f64 = 0.5;
         let (rect, y, _) = self.cursor();
-        if y + h > rect.bottom() + 0.01 && h <= rect.h + 0.01 {
+        if y + h > rect.bottom() + 0.01 && h <= rect.h + FIT_TOLERANCE {
             self.make_room(h)?;
         }
         let (rect, y, _) = self.cursor();
@@ -611,9 +625,11 @@ impl Layouter<'_> {
             .filter_map(solid_extent)
             .map(|e| e.1)
             .fold(y + h, f64::max);
-        if y + h <= rect.bottom() + 0.01 && drawn <= page_h + 0.01 {
+        if y + h <= rect.bottom() + FIT_TOLERANCE && drawn <= page_h + 0.01 {
             self.leaves.clear();
-            self.place(h);
+            // Consume the available height when the excess is only rounding, so
+            // a trailing zero-sized signature does not create an empty page.
+            self.place(h.min((rect.bottom() - y).max(0.0)));
             return Ok(());
         }
         self.split_block(first, y, drawn)
@@ -851,7 +867,7 @@ impl Layouter<'_> {
     fn instances(&self, node: &Node, parent_som: &str) -> usize {
         let Node::Subform(sf) = node else { return 1 };
         let from_data = match (&sf.common.name, self.data) {
-            (Some(name), Some(d)) if sf.occur.max != Some(1) => d.count(&data_path(self.tpl, parent_som), name),
+            (Some(name), Some(d)) if sf.occur.max != Some(1) => crate::data::bound_instances(self.tpl, d, &format!("{parent_som}.{name}[0]")),
             _ => 0,
         };
         instance_count(&sf.occur, from_data)
@@ -862,7 +878,7 @@ impl Layouter<'_> {
     fn warn_truncated(&mut self, node: &Node, parent_som: &str, laid_out: usize) {
         let Node::Subform(sf) = node else { return };
         let from_data = match (&sf.common.name, self.data) {
-            (Some(name), Some(d)) if sf.occur.max != Some(1) => d.count(&data_path(self.tpl, parent_som), name),
+            (Some(name), Some(d)) if sf.occur.max != Some(1) => crate::data::bound_instances(self.tpl, d, &format!("{parent_som}.{name}[0]")),
             _ => 0,
         };
         if from_data > laid_out {
@@ -920,7 +936,15 @@ impl Layouter<'_> {
                     let inner = (avail_w - c.margin.horizontal()).max(1.0);
                     (self.content_width(node, inner, &ctx, depth) + c.margin.horizontal()).min(avail_w)
                 }
-                Node::Field(_) | Node::Draw(_) => avail_w,
+                Node::Draw(d) => {
+                    let width = match &d.value {
+                        Value::Text(t) => Some(text::natural_width(&text::plain(t), &Face::of(&ctx.font), &|id| self.embed(id))),
+                        Value::Rich(r) => Some(text::natural_width(r, &Face::of(&ctx.font), &|id| self.embed(id))),
+                        _ => None,
+                    };
+                    width.map_or(avail_w, |w| (w + c.margin.horizontal()).min(avail_w))
+                }
+                Node::Field(_) => avail_w,
             },
         };
         let w = clamp_opt(w, c.min_w, c.max_w);
@@ -1529,7 +1553,7 @@ impl Layouter<'_> {
                     match base64::engine::general_purpose::STANDARD.decode(&text) {
                         Ok(d) if crate::image::kind(&d).is_some() => Some(d),
                         Ok(_) => {
-                            self.warn_once(format!("{field_name}: the picture in the data is not a JPEG, PNG or GIF and is left out"));
+                            self.warn_once(format!("{field_name}: the picture in the data is not a JPEG, PNG, GIF, TIFF or BMP and is left out"));
                             None
                         }
                         Err(_) => {
@@ -1547,18 +1571,25 @@ impl Layouter<'_> {
                 // Then the field itself, which clicking gives a new picture.
             }
             Ui::Barcode => {
-                // The value as text, where the bars would be.
-                self.warn_once("barcode fields show their value as text, not as bars");
+                let path = data_path(self.tpl, &som_path());
                 let value = self
                     .data
-                    .and_then(|d| d.text_at(&data_path(self.tpl, &som_path())))
+                    .filter(|_| !path.is_empty())
+                    .and_then(|d| d.text_at(&path))
                     .map(str::to_string)
                     .or_else(|| f.value.plain())
                     .unwrap_or_default();
-                if !value.trim().is_empty() {
-                    let mut para = fctx.para.clone();
-                    para.h_align = HAlign::Center;
-                    self.draw_value_text(&Value::Text(value), ui.inset(&f.ui_margin), &fctx.font, &para)?;
+                if !value.is_empty() {
+                    let box_ = ui.inset(&f.ui_margin);
+                    match crate::barcode::bars(&value, &f.properties, box_) {
+                        Ok(bars) => {
+                            self.push(Item::Fill { rect: box_, color: [1.0; 3] })?;
+                            for rect in bars {
+                                self.push(Item::Fill { rect, color: [0.0; 3] })?;
+                            }
+                        }
+                        Err(why) => self.warn_once(format!("{}: {why}", f.common.name.as_deref().unwrap_or("barcode"))),
+                    }
                 }
                 return Ok(());
             }
@@ -1687,6 +1718,7 @@ impl Layouter<'_> {
             h_align,
             multiline: f.multiline,
             max_chars: f.max_chars,
+            number_digits: f.number_digits,
             read_only,
             border,
             value,

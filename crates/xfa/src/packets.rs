@@ -157,3 +157,50 @@ pub fn read_packets(doc: &Document) -> Result<Option<Packets>, XfaError> {
     }
     Ok(Some(Packets { xdp, needs_rendering: needs_rendering.unwrap_or(false), has_fields }))
 }
+
+/// Discard saved form-instance state for `xfa.form.remerge()`. The immutable template,
+/// datasets and unknown packets stay intact; an undo restores the old object graph.
+pub fn clear_saved_form(doc: &mut Document) -> Result<(), XfaError> {
+    let root = doc.root().ok_or(XfaError::NotXfa)?;
+    let catalog = doc.get(root);
+    let acro_obj = catalog.as_dict().and_then(|d| d.get(b"AcroForm")).cloned().ok_or(XfaError::NotXfa)?;
+    let mut acro = doc.resolve(&acro_obj).as_dict().cloned().ok_or(XfaError::NotXfa)?;
+    let xfa = acro.get(b"XFA").cloned().ok_or(XfaError::NotXfa)?;
+    let replacement = match &*doc.resolve(&xfa) {
+        Object::Array(items) => {
+            let kept = items
+                .chunks(2)
+                .filter(|pair| !pair.first().and_then(Object::as_string).is_some_and(|s| s.to_text() == "form"))
+                .flat_map(|pair| pair.iter().cloned())
+                .collect();
+            Object::Array(kept)
+        }
+        Object::Stream(stream) => {
+            let bytes = stream.decoded_within(MAX_XDP)?;
+            let (mut text, encoding) = decode(&bytes).ok_or_else(|| XfaError::Malformed("the saved form's encoding cannot be preserved".into()))?;
+            if crate::xml_nesting_depth(&text) > crate::MAX_XML_DEPTH {
+                return Err(XfaError::TooLarge("the XDP is nested too deeply to remerge".into()));
+            }
+            let xml = roxmltree::Document::parse_with_options(&text, roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 1_000_000 })
+                .map_err(|e| XfaError::Malformed(e.to_string()))?;
+            let ranges: Vec<_> = xml
+                .root_element()
+                .children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "form" && n.tag_name().namespace().is_some_and(|ns| ns.contains("xfa-form")))
+                .map(|n| n.range())
+                .collect();
+            for range in ranges.into_iter().rev() {
+                // roxmltree ranges are byte offsets at UTF-8 character boundaries.
+                text.replace_range(range, "");
+            }
+            Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(pdfcraft_cos::Dict::new(), &encode(&text, encoding)))))
+        }
+        _ => return Err(XfaError::Malformed("XFA must be a stream or packet array".into())),
+    };
+    acro.set(b"XFA".to_vec(), replacement);
+    match acro_obj.as_ref() {
+        Some(r) => doc.set(r, Object::Dict(acro)),
+        None => doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(acro)))?,
+    }
+    Ok(())
+}

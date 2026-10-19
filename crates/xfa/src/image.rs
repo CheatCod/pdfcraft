@@ -1,4 +1,4 @@
-//! Pictures in templates and data: JPEG (embedded as is), PNG and GIF (decoded to 8-bit
+//! Pictures in templates and data: JPEG (embedded as is), PNG, GIF, TIFF and BMP (decoded to 8-bit
 //! samples with a soft mask for transparency). Sizes are read from the headers without
 //! decoding, so layout stays cheap; decoding happens once, when the PDF is written.
 
@@ -13,6 +13,8 @@ pub enum Kind {
     Jpeg,
     Png,
     Gif,
+    Tiff,
+    Bmp,
 }
 
 /// What the bytes are, by their signature (the declared content type is often wrong).
@@ -23,6 +25,10 @@ pub fn kind(data: &[u8]) -> Option<Kind> {
         Some(Kind::Png)
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
         Some(Kind::Gif)
+    } else if data.starts_with(b"II\x2a\x00") || data.starts_with(b"MM\x00\x2a") {
+        Some(Kind::Tiff)
+    } else if data.starts_with(b"BM") {
+        Some(Kind::Bmp)
     } else {
         None
     }
@@ -51,6 +57,14 @@ fn header_size(data: &[u8]) -> Option<(u32, u32)> {
             let (w, h) = (be(16)?, be(20)?);
             (w > 0 && h > 0).then_some((w, h))
         }
+        k @ (Kind::Tiff | Kind::Bmp) => {
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(data),
+                if k == Kind::Bmp { image::ImageFormat::Bmp } else { image::ImageFormat::Tiff },
+            );
+            reader.limits(decoder_limits());
+            reader.into_dimensions().ok()
+        }
         Kind::Gif => {
             let le = |at: usize| data.get(at..at + 2).map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
             let (w, h) = (le(6)?, le(8)?);
@@ -76,7 +90,15 @@ fn too_big() -> String {
     format!("an image has more than {} million pixels and is left out", MAX_PIXELS / 1_000_000)
 }
 
-/// Decode a PNG or GIF (its first frame). JPEGs are embedded as they are and are not decoded
+fn decoder_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_PIXELS * 4);
+    limits
+}
+
+/// Decode a PNG, GIF, TIFF or BMP (its first frame). JPEGs are embedded as they are and are not decoded
 /// here. The error is the warning to show.
 pub fn decode(data: &[u8]) -> Result<Decoded, String> {
     let bad = |m: String| format!("an image could not be decoded and is left out: {m}");
@@ -117,16 +139,16 @@ pub fn decode(data: &[u8]) -> Result<Decoded, String> {
             let alpha = (has_alpha && alpha.iter().any(|a| *a != 255)).then_some(alpha);
             Ok(Decoded { width: frame.width, height: frame.height, color_space, samples: colour, alpha })
         }
-        Some(Kind::Gif) => {
+        Some(k @ (Kind::Gif | Kind::Tiff | Kind::Bmp)) => {
             // The frame may be larger than the logical screen the header gives: the decoder is
             // told the limits, so it refuses before allocating.
             let mut reader = image::ImageReader::new(std::io::Cursor::new(data));
-            reader.set_format(image::ImageFormat::Gif);
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(MAX_SIDE);
-            limits.max_image_height = Some(MAX_SIDE);
-            limits.max_alloc = Some(MAX_PIXELS * 4);
-            reader.limits(limits);
+            reader.set_format(match k {
+                Kind::Gif => image::ImageFormat::Gif,
+                Kind::Bmp => image::ImageFormat::Bmp,
+                _ => image::ImageFormat::Tiff,
+            });
+            reader.limits(decoder_limits());
             let img = reader.decode().map_err(|e| if matches!(e, image::ImageError::Limits(_)) { too_big() } else { bad(e.to_string()) })?;
             let rgba = img.into_rgba8();
             let (width, height) = rgba.dimensions();
@@ -139,6 +161,6 @@ pub fn decode(data: &[u8]) -> Result<Decoded, String> {
             let alpha = px.iter().any(|p| p[3] != 255).then(|| px.iter().map(|p| p[3]).collect());
             Ok(Decoded { width, height, color_space: if gray { "DeviceGray" } else { "DeviceRGB" }, samples, alpha })
         }
-        Some(Kind::Jpeg) | None => Err(bad("not a PNG or GIF".into())),
+        Some(Kind::Jpeg) | None => Err(bad("not a PNG, GIF, TIFF or BMP".into())),
     }
 }

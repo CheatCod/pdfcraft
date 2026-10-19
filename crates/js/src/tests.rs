@@ -382,7 +382,7 @@ mod xfa_model {
 
     fn go(script: &str, target: &str, activity: &str) -> XfaOutcome {
         let ev = XfaEvent { activity: activity.into(), target: target.into(), ..Default::default() };
-        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3 };
+        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3, ..Default::default() };
         run_xfa(script, &ev, &doc, &form(), Limits::default())
     }
 
@@ -479,7 +479,7 @@ mod xfa_model {
     #[test]
     fn host_layout_event_and_app_calls_become_effects() {
         let o = go(
-            "xfa.host.messageBox('Hi', 'T', 3, 1); xfa.host.resetData('qty, price'); xfa.host.print(1, '0', '2', 0, 0, 0, 0, 0); app.execMenuItem('SaveAs'); app.launchURL('https://x.test'); xfa.host.setFocus('qty'); xfa.form.recalculate(1); console.println('p' + xfa.layout.page(this) + '/' + xfa.layout.pageCount() + '/' + xfa.host.currentPage + '/' + xfa.event.name); this.border.fill.color.value = '255,0,0'; this.fillColor = 'x'; util.printf('%d', 7)",
+            "xfa.host.messageBox('Hi', 'T', 3, 0); xfa.host.resetData('qty, price'); xfa.host.print(1, '0', '2', 0, 0, 0, 0, 0); app.execMenuItem('SaveAs'); app.launchURL('https://x.test'); xfa.host.setFocus('qty'); xfa.form.recalculate(1); console.println('p' + xfa.layout.page(this) + '/' + xfa.layout.pageCount() + '/' + xfa.host.currentPage + '/' + xfa.event.name); this.border.fill.color.value = '255,0,0'; this.fillColor = 'x'; util.printf('%d', 7)",
             "form1[0].page1[0].go[0]",
             "click",
         );
@@ -494,6 +494,7 @@ mod xfa_model {
                 XfaEffect::LaunchUrl("https://x.test".into()),
                 XfaEffect::SetFocus("form1[0].page1[0].qty[0]".into()),
                 XfaEffect::Recalculate,
+                XfaEffect::SetProperty { som: "form1[0].page1[0].go[0]".into(), path: "border.fill.color.value".into(), value: "255,0,0".into() },
             ]
         );
         assert_eq!(o.console, vec!["p2/3/1/click".to_string()]);
@@ -596,7 +597,7 @@ mod formcalc {
 
     fn go(script: &str, target: &str, activity: &str) -> XfaOutcome {
         let ev = XfaEvent { activity: activity.into(), target: target.into(), ..Default::default() };
-        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3 };
+        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3, ..Default::default() };
         run_formcalc(script, &ev, &doc, &form(), Limits::default())
     }
 

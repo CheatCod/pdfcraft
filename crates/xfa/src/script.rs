@@ -27,6 +27,10 @@ pub enum NodeKind {
     ExclGroup,
     Draw,
     Area,
+    Script,
+    Variable,
+    Manifest,
+    Ref,
 }
 
 /// One object of the live form.
@@ -44,6 +48,7 @@ pub struct FormNode {
     pub occur_max: Option<usize>,
     pub index: usize,
     pub children: Vec<FormNode>,
+    pub properties: BTreeMap<String, String>,
 }
 
 /// A script the template runs for an event of one node instance.
@@ -75,11 +80,12 @@ pub struct LiveForm {
 pub struct Overrides {
     pub presence: BTreeMap<String, String>,
     pub access: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, String>,
 }
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
-        self.presence.is_empty() && self.access.is_empty()
+        self.presence.is_empty() && self.access.is_empty() && self.properties.is_empty()
     }
 }
 
@@ -115,7 +121,7 @@ pub fn overrides(doc: &Document) -> Overrides {
     let Some((_, acro)) = acroform(doc) else { return out };
     let Some(o) = acro.get(OVERRIDES_KEY).map(|o| doc.resolve(o)) else { return out };
     let Some(d) = o.as_dict() else { return out };
-    for (which, map) in [(&b"Presence"[..], &mut out.presence), (&b"Access"[..], &mut out.access)] {
+    for (which, map) in [(&b"Presence"[..], &mut out.presence), (&b"Access"[..], &mut out.access), (&b"Properties"[..], &mut out.properties)] {
         if let Some(m) = d.get(which).map(|m| doc.resolve(m))
             && let Some(m) = m.as_dict()
         {
@@ -137,7 +143,7 @@ pub fn set_overrides(doc: &mut Document, ov: &Overrides) -> Result<(), XfaError>
         acro.remove(OVERRIDES_KEY);
     } else {
         let mut d = Dict::new();
-        for (which, map) in [("Presence", &ov.presence), ("Access", &ov.access)] {
+        for (which, map) in [("Presence", &ov.presence), ("Access", &ov.access), ("Properties", &ov.properties)] {
             if map.is_empty() {
                 continue;
             }
@@ -235,6 +241,26 @@ impl Walker<'_> {
         self.ov.access.get(som).cloned().unwrap_or_else(|| access_name(a).to_string())
     }
 
+    fn properties(&self, som: &str, original: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut props = original.clone();
+        let prefix = format!("{som}|");
+        for (key, value) in &self.ov.properties {
+            if let Some(path) = key.strip_prefix(&prefix) {
+                props.insert(path.to_string(), value.clone());
+            }
+        }
+        // Keep the binding chosen by the template, including aliases and repeated
+        // containers. A manifest's `.dataNode` must read the serialized answer.
+        props.remove("$dataPath");
+        let path = data_path(self.tpl, som);
+        if !path.is_empty()
+            && let Ok(path) = serde_json::to_string(&path)
+        {
+            props.insert("$dataPath".into(), path);
+        }
+        props
+    }
+
     fn field(&mut self, f: &Field, parent_som: &str, index: usize, radio: Option<&str>) -> FormNode {
         let som = child_som(parent_som, f.common.name.as_deref().or(Some("field")), index);
         let data_value = self.data.and_then(|d| d.value_at(&data_path(self.tpl, &som))).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
@@ -248,11 +274,15 @@ impl Walker<'_> {
             (None, None) => f.value.plain().map(|v| f.saved_value(v.trim())).unwrap_or_default(),
         };
         self.push_events(&som, &f.scripts, f.calculate.as_ref(), f.validate.as_ref(), f.validate_message.as_deref());
+        let mut properties = self.properties(&som, &f.properties);
+        if radio.is_some() {
+            properties.insert("$onValue".into(), f.items.first().cloned().unwrap_or_default());
+        }
         FormNode {
             name: f.common.name.clone().unwrap_or_else(|| "field".into()),
             som: som.clone(),
             kind: Some(NodeKind::Field),
-            value,
+            value: self.ov.properties.get(&format!("{som}|$value")).cloned().unwrap_or(value),
             numeric: f.numeric,
             presence: self.presence(&som, f.common.presence),
             access: self.access(&som, f.access),
@@ -261,6 +291,7 @@ impl Walker<'_> {
             occur_max: Some(1),
             index,
             children: Vec::new(),
+            properties,
         }
     }
 
@@ -288,7 +319,9 @@ impl Walker<'_> {
             match n {
                 Node::Subform(sf) => {
                     let from_data = match (&sf.common.name, self.data) {
-                        (Some(name), Some(d)) if sf.occur.max != Some(1) => d.count(&data_path(self.tpl, parent_som), name),
+                        (Some(name), Some(d)) if sf.occur.max != Some(1) => {
+                            crate::data::bound_instances(self.tpl, d, &format!("{parent_som}.{name}[0]"))
+                        }
                         _ => 0,
                     };
                     let instances = crate::layout::instance_count(&sf.occur, from_data);
@@ -300,7 +333,47 @@ impl Walker<'_> {
                         let index = sib + k;
                         let som = child_som(parent_som, sf.common.name.as_deref(), index);
                         self.push_events(&som, &sf.scripts, None, None, None);
-                        let children = self.children(&sf.children, &som, depth + 1);
+                        let mut children = self.children(&sf.children, &som, depth + 1);
+                        for v in &sf.variables {
+                            if !self.take() {
+                                break;
+                            }
+                            let vsom = format!("{som}.#variables[0].{}[0]", v.name);
+                            children.push(FormNode {
+                                name: v.name.clone(),
+                                som: vsom.clone(),
+                                kind: Some(if v.script { NodeKind::Script } else { NodeKind::Variable }),
+                                value: self.ov.properties.get(&format!("{vsom}|$value")).cloned().unwrap_or_else(|| v.value.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        for manifest in &sf.manifests {
+                            if !self.take() {
+                                break;
+                            }
+                            let msom = format!("{som}.{}[0]", manifest.name);
+                            let mut refs = Vec::new();
+                            for (index, value) in manifest.refs.iter().enumerate() {
+                                if !self.take() {
+                                    break;
+                                }
+                                refs.push(FormNode {
+                                    name: "#ref".into(),
+                                    som: format!("{msom}.#ref[{index}]"),
+                                    kind: Some(NodeKind::Ref),
+                                    value: value.clone(),
+                                    index,
+                                    ..Default::default()
+                                });
+                            }
+                            children.push(FormNode {
+                                name: manifest.name.clone(),
+                                som: msom,
+                                kind: Some(NodeKind::Manifest),
+                                children: refs,
+                                ..Default::default()
+                            });
+                        }
                         out.push(FormNode {
                             name: sf.common.name.clone().unwrap_or_else(|| "#subform".into()),
                             som: som.clone(),
@@ -309,6 +382,7 @@ impl Walker<'_> {
                             numeric: false,
                             presence: self.presence(&som, sf.common.presence),
                             access: "open".into(),
+                            properties: self.properties(&som, &BTreeMap::new()),
                             repeatable: sf.occur.max != Some(1),
                             occur_min: sf.occur.min,
                             occur_max: sf.occur.max,
@@ -326,6 +400,7 @@ impl Walker<'_> {
                         kind: Some(NodeKind::Area),
                         presence: self.presence(&som, a.common.presence),
                         access: "open".into(),
+                        properties: self.properties(&som, &BTreeMap::new()),
                         occur_min: 1,
                         occur_max: Some(1),
                         index: sib,
@@ -370,6 +445,7 @@ impl Walker<'_> {
                         value: selected.unwrap_or_default(),
                         presence: self.presence(&som, g.common.presence),
                         access: "open".into(),
+                        properties: self.properties(&som, &BTreeMap::new()),
                         occur_min: 1,
                         occur_max: Some(1),
                         index: sib,
@@ -440,6 +516,56 @@ pub fn has_scripts(tpl: &Template) -> bool {
     any(&tpl.root.scripts) || walk(&tpl.root.children, 1) || tpl.root.page_set.as_ref().is_some_and(|ps| ps.areas.iter().any(|a| walk(&a.items, 1)))
 }
 
+/// Apply the script's UI border properties to the widget's layout appearance.
+fn field_properties(f: &mut Field, som: &str, ov: &Overrides) {
+    let prefix = format!("{som}|");
+    for (key, value) in &ov.properties {
+        if let Some(path) = key.strip_prefix(&prefix) {
+            f.properties.insert(path.to_string(), value.clone());
+        }
+    }
+    if let Some(value) = f.properties.get("$value") {
+        f.value = Value::Text(value.clone());
+    }
+    if let Some(json) = f.properties.get("$items")
+        && json.len() <= 65_536
+        && let Ok(items) = serde_json::from_str::<Vec<(String, String)>>(json)
+        && items.len() <= 1000
+    {
+        (f.item_values, f.items) = items.into_iter().unzip();
+    }
+    if let Some(value) = f.properties.get("caption.value.text.value")
+        && let Some(caption) = &mut f.caption
+    {
+        caption.value = Value::Text(value.clone());
+    }
+    let ui = f.properties.get("uiType").map(String::as_str).unwrap_or("textEdit");
+    let prefix = format!("ui.{ui}.border.");
+    if !f.properties.keys().any(|p| p.starts_with(&prefix)) {
+        return;
+    }
+    let border = f.ui_border.get_or_insert_with(Border::default);
+    if let Some(p) = f.properties.get(&format!("{prefix}presence")) {
+        border.presence = Presence::parse(Some(p));
+    }
+    if let Some(c) = f.properties.get(&format!("{prefix}fill.color.value")).and_then(|v| Color::parse(v)) {
+        border.fill = Some(c);
+    }
+    for (i, edge) in border.edges.iter_mut().enumerate() {
+        let ep = if i == 0 { format!("{prefix}edge.") } else { format!("{prefix}edge[{i}].") };
+        let attr = |name: &str| f.properties.get(&format!("{ep}{name}")).or_else(|| f.properties.get(&format!("{prefix}edge.{name}")));
+        if let Some(p) = attr("presence") {
+            edge.presence = Presence::parse(Some(p));
+        }
+        if let Some(c) = attr("color.value").and_then(|s| Color::parse(s)) {
+            edge.color = c;
+        }
+        if let Some(w) = attr("thickness").and_then(|s| crate::parse::measure(s)) {
+            edge.thickness = w.max(0.0);
+        }
+    }
+}
+
 /// The template with `ov` applied to its objects (instance 0 of each; scripts that hide one
 /// instance of a repeating subform hide them all).
 pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
@@ -472,6 +598,7 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
                     walk(&mut a.children, &som, ov, depth + 1);
                 }
                 Node::Field(f) => {
+                    field_properties(f, &som, ov);
                     if let Some(p) = presence {
                         f.common.presence = p;
                     }
@@ -497,6 +624,7 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
                     let fsibs = SomIndices::of(&fields);
                     for (fi, f) in g.fields.iter_mut().enumerate() {
                         let fsom = child_som(&som, f.common.name.as_deref().or(Some("field")), fsibs.at(fi));
+                        field_properties(f, &fsom, ov);
                         if let Some(p) = ov.presence.get(&fsom) {
                             f.common.presence = Presence::parse(Some(p));
                         }
@@ -511,6 +639,12 @@ pub fn apply_overrides(tpl: &Template, ov: &Overrides) -> Template {
         walk(&mut root, "", ov, 0);
         if let Some(Node::Subform(r)) = root.pop() {
             t.root = *r;
+        }
+        if let Some(ps) = &mut t.root.page_set {
+            for (i, area) in ps.areas.iter_mut().enumerate() {
+                let som = area.name.as_ref().map(|n| format!("{n}[0]")).unwrap_or_else(|| format!("#pageArea[{i}]"));
+                walk(&mut area.items, &som, ov, 1);
+            }
         }
     }
     t

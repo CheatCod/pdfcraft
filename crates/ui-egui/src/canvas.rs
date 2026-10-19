@@ -4065,6 +4065,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             crate::forms_ui::FormNotice::NoAction(name) => app.notify_fmt("{name} has no action", &[("name", &name)]),
         }
     }
+    if let Some((name, text)) = app.views[index].forms.draft_change.take() {
+        let id = app.views[index].id;
+        app.preview_form_change(id, &name, &text);
+    }
     if let Some((name, action)) = app.views[index].forms.button.take() {
         run_button(app, index, &name, action);
     }

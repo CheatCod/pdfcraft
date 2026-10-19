@@ -2277,3 +2277,33 @@ fn document_scripts_read_each_name_tree_node_once() {
     ]);
     assert_eq!(document_scripts_named(&doc), [("init".to_string(), "var ready = true;".to_string())]);
 }
+
+#[test]
+fn pushbutton_caption_uses_default_appearance_font_size_and_colour() {
+    let mut doc = one_page();
+    let name = add_field(&mut doc, 0, [50.0, 600.0, 250.0, 650.0], &NewField::Button { caption: "Validate".into() }, Some("validate")).unwrap();
+    let af = doc.get(doc.root().unwrap()).as_dict().unwrap().reference(b"AcroForm").unwrap();
+    let mut font = Dict::new();
+    font.set(b"Type".to_vec(), Object::name("Font"));
+    font.set(b"Subtype".to_vec(), Object::name("Type1"));
+    font.set(b"BaseFont".to_vec(), Object::name("Helvetica-Bold"));
+    let mut fonts = Dict::new();
+    fonts.set(b"Bold".to_vec(), Object::Dict(font));
+    let mut resources = Dict::new();
+    resources.set(b"Font".to_vec(), Object::Dict(fonts));
+    doc.update_dict(af, |d| d.set(b"DR".to_vec(), Object::Dict(resources))).unwrap();
+    let obj = field(&fields(&doc), &name).obj;
+    doc.update_dict(obj, |d| d.set(b"DA".to_vec(), pdfcraft_cos::PdfString::text("/Bold 14 Tf 1 1 1 rg"))).unwrap();
+    redraw_field(&mut doc, &name).unwrap();
+    let f = field(&fields(&doc), &name).clone();
+    let content = ap(&doc, &f.widgets[0]);
+    assert!(content.contains("14 Tf 1 1 1 rg"), "{content}");
+    assert!(content.contains("(Validate) Tj"));
+    let wd = doc.get(f.widgets[0].obj);
+    let appearance = doc.resolve(wd.as_dict().unwrap().get(b"AP").unwrap());
+    let normal = doc.resolve(appearance.as_dict().unwrap().get(b"N").unwrap());
+    let Object::Stream(stream) = &*normal else { panic!("expected appearance") };
+    let resources = stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
+    let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+    assert!(fonts.iter().any(|(_, font)| doc.resolve(font).as_dict().unwrap().name(b"BaseFont") == Some(b"Helvetica-Bold")));
+}

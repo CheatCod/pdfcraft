@@ -2,10 +2,9 @@
 //! form was saved with, and writing the values of its fields back, so Adobe's viewers (which
 //! lay the form out from the XFA packets) show what was filled in here.
 //!
-//! Binding is the default "normal" one: a field's data node is named after the field and nested
-//! under nodes named after its named ancestor subforms, repeated instances as repeated sibling
-//! elements. Areas are named in SOM expressions but are not data scopes, so their contents bind
-//! under the area's parent ([`data_path`]). Explicit `bind ref` expressions are not followed.
+//! Normal binding follows named ancestor subforms. Explicit data references override that
+//! path; containers with `bind match="none"` and areas are not data scopes. Repeated instances
+//! bind to repeated sibling elements. See [`data_path`].
 
 use std::collections::HashMap;
 
@@ -101,45 +100,78 @@ pub fn som_to_path(som: &str) -> DataPath {
         .collect()
 }
 
-/// The data path the object at `som` binds to: [`som_to_path`] without the areas on the way.
-/// An area is a named container in the form, so it is part of SOM expressions, but only
-/// subforms, exclusion groups and fields are data scopes: what an area holds binds under the
-/// area's parent, as Adobe's viewers write it. The template tells which segments are areas;
-/// segments it doesn't have (page-set objects, or a SOM from another template) are kept.
+/// The data path an object binds to, including explicit references and unbound containers.
+/// Areas and page masters do not introduce data scopes. An unbound field returns an empty
+/// path: its calculated value belongs to the form model rather than the datasets packet.
 pub fn data_path(tpl: &Template, som: &str) -> DataPath {
     let mut out = DataPath::new();
-    // The template children the next segment is looked up in; `None` until the root matched,
-    // and again once a segment is not a container the template has.
     let mut level: Option<&[Node]> = None;
+    let mut group = None;
     for (i, (name, index)) in som_to_path(som).into_iter().enumerate() {
-        let found = match level {
-            None if i == 0 && tpl.root.common.name.as_deref() == Some(name.as_str()) => Some(Container::Children(&tpl.root.children)),
-            None => None,
-            Some(children) => match named(children, &name, 0) {
-                Some(Node::Subform(sf)) => Some(Container::Children(&sf.children)),
-                Some(Node::Area(a)) => Some(Container::Area(&a.children)),
+        if i == 0
+            && let Some(area) = tpl.root.page_set.as_ref().and_then(|ps| ps.areas.iter().find(|a| a.name.as_deref() == Some(&name)))
+        {
+            level = Some(&area.items);
+            continue;
+        }
+        let node = level.and_then(|nodes| named(nodes, &name, 0));
+        let common = if i == 0 && tpl.root.common.name.as_deref() == Some(&name) {
+            level = Some(&tpl.root.children);
+            Some(&tpl.root.common)
+        } else if let Some(node) = node {
+            level = match node {
+                Node::Subform(sf) => Some(&sf.children),
+                Node::Area(a) => Some(&a.children),
                 _ => None,
-            },
+            };
+            group = match node {
+                Node::ExclGroup(g) => Some(g.as_ref()),
+                _ => None,
+            };
+            Some(node.common())
+        } else {
+            level = None;
+            group.and_then(|g| g.fields.iter().find(|f| f.common.name.as_deref() == Some(&name)).map(|f| &f.common))
         };
-        match found {
-            Some(Container::Area(children)) => level = Some(children),
-            Some(Container::Children(children)) => {
-                level = Some(children);
-                out.push((name, index));
+        if matches!(node, Some(Node::Area(_))) {
+            continue;
+        }
+        match common.and_then(|c| c.bind.as_deref()) {
+            Some("") if matches!(node, Some(Node::Field(_))) => return Vec::new(),
+            Some("") => {}
+            Some(reference) => {
+                let relative = if let Some(r) = reference.strip_prefix("$record.") {
+                    out.truncate(1);
+                    r
+                } else if let Some(r) = reference.strip_prefix("$data.").or_else(|| reference.strip_prefix("xfa.datasets.data.")) {
+                    out.clear();
+                    r
+                } else {
+                    reference.strip_prefix("$.").unwrap_or(reference)
+                };
+                for segment in relative.split('.').take(MAX_DEPTH) {
+                    if segment.is_empty() || segment == "$" {
+                        continue;
+                    }
+                    let repeated = segment.ends_with("[*]");
+                    let mut path = som_to_path(segment);
+                    if repeated && let Some((_, k)) = path.last_mut() {
+                        *k = index;
+                    }
+                    out.extend(path);
+                }
             }
-            None => {
-                level = None;
-                out.push((name, index));
-            }
+            None => out.push((name, index)),
         }
     }
     out
 }
 
-enum Container<'a> {
-    Children(&'a [Node]),
-    /// Contents bind under the area's parent.
-    Area(&'a [Node]),
+/// Count repeated data using the resolved binding, whose element name can differ from SOM.
+pub(crate) fn bound_instances(tpl: &Template, data: &DataNode, som: &str) -> usize {
+    let mut path = data_path(tpl, som);
+    let Some((name, _)) = path.pop() else { return 0 };
+    data.count(&path, &name)
 }
 
 /// The child of `nodes` named `name`, looking through unnamed subforms and areas (which have no
@@ -482,6 +514,7 @@ enum Op<'a> {
     ReplaceData(&'a [ImportNode]),
     /// Make the leaf at this path a picture: base64 text with its content type.
     Picture(&'a DataPath, &'a str, &'a str),
+    LoadXml(&'a DataPath, &'a str, bool),
 }
 
 /// Note that a value could not be written (once per kind of reason, naming a few fields).
@@ -731,7 +764,7 @@ fn serialize_node(n: &ImportNode, xfa: &str, out: &mut String, depth: usize) {
 fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merged {
     let wants: &[Want] = match op {
         Op::Values(w) => w,
-        Op::Remove(_) | Op::ReplaceData(_) | Op::Picture(..) => &[],
+        Op::Remove(_) | Op::ReplaceData(_) | Op::Picture(..) | Op::LoadXml(..) => &[],
     };
     // Fresh data, where none exists yet (declared with the `xfa` prefix).
     let fresh_children = |warnings: &mut Vec<String>| match op {
@@ -764,6 +797,56 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
         .descendants()
         .find(|n| is(n, "datasets") && n.tag_name().namespace() == Some(XFA_DATA_NS))
         .or_else(|| parsed.descendants().find(|n| is(n, "datasets")));
+    if let Op::LoadXml(path, markup, overwrite) = op {
+        let Some(ds) = datasets else {
+            warnings.push("loadXML requires a datasets packet".into());
+            return Merged::Failed;
+        };
+        let mut target = ds;
+        let mut missing = None;
+        for (position, (name, index)) in path.iter().enumerate() {
+            match target.children().filter(|c| c.is_element() && c.tag_name().name() == name).nth(*index) {
+                Some(n) => target = n,
+                None if position + 1 == path.len() && *index == 0 => {
+                    missing = Some(name);
+                    break;
+                }
+                None => {
+                    warnings.push("loadXML target data node does not exist".into());
+                    return Merged::Failed;
+                }
+            }
+        }
+        let edit = if let Some(name) = missing {
+            append_edit(src, target, &format!("<{}>{markup}</{}>", xml_name(name), xml_name(name)))
+        } else if overwrite {
+            let tag = qname(src, &target.range()).unwrap_or("value");
+            let range = target.range();
+            start_tag_end(src, &range).and_then(|end| {
+                let start = src.get(range.start..end)?;
+                let start = start.trim_end_matches('>').trim_end_matches('/');
+                Some(Edit { start: range.start, end: range.end, text: format!("{start}>{markup}</{tag}>") })
+            })
+        } else {
+            append_edit(src, target, markup)
+        };
+        let Some(edit) = edit else {
+            warnings.push("loadXML target could not be rewritten".into());
+            return Merged::Failed;
+        };
+        let mut out = src.to_string();
+        if out.get(edit.start..edit.end).is_none() {
+            return Merged::Failed;
+        }
+        if out.get(edit.start..edit.end) == Some(edit.text.as_str()) {
+            return Merged::Unchanged;
+        }
+        out.replace_range(edit.start..edit.end, &edit.text);
+        if shift > 0 {
+            out = out.get(shift..out.len().saturating_sub(WRAP_CLOSE.len())).unwrap_or_default().to_string();
+        }
+        return Merged::Changed(out);
+    }
     let mut edits = Vec::new();
     let mut data = None;
     match datasets {
@@ -802,6 +885,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
     }
     if let Some(data) = data {
         match op {
+            Op::LoadXml(..) => {}
             Op::Values(w) => merge_values(src, data, w, &mut edits, warnings),
             Op::ReplaceData(nodes) => {
                 // Everything between the start and end tags; `<xfa:data/>` opens up. Written
@@ -1237,7 +1321,7 @@ pub fn import_data(doc: &mut Document, text: &str, expect_root: Option<&str>, re
 }
 
 /// The datasets packet's text: from the XFA array's `datasets` item, or the whole XDP.
-fn datasets_packet(doc: &Document) -> Result<Option<String>, XfaError> {
+pub fn datasets_packet(doc: &Document) -> Result<Option<String>, XfaError> {
     let Some(root) = doc.root() else { return Ok(None) };
     let catalog = doc.get(root);
     let Some(acro) = catalog.as_dict().and_then(|c| c.get(b"AcroForm")).map(|a| doc.resolve(a)) else { return Ok(None) };
@@ -1531,6 +1615,9 @@ fn values_at(doc: &Document, tpl: Option<&Template>, fields: &[FieldDatum]) -> V
     let mut out = Vec::new();
     for f in fields {
         let path = path_of(tpl, &som_of(doc, f));
+        if path.is_empty() {
+            continue;
+        }
         let Some(text) = data.value_at(&path) else { continue };
         let text = text.as_str();
         let value = match &f.data {
@@ -1557,4 +1644,28 @@ pub fn is_on(text: &str, on: &str) -> bool {
         return true;
     }
     !matches!(t.to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no") && on.trim().is_empty()
+}
+
+/// Load XML into an attached data-model node, preserving the surrounding packet and encoding.
+/// `path` starts below datasets, so it can name either form data or an auxiliary list.
+pub fn load_dataset_xml(
+    doc: &mut Document,
+    path: &DataPath,
+    xml: &str,
+    ignore_root: bool,
+    overwrite: bool,
+    reuse: Option<ObjRef>,
+) -> Result<DatasetsWrite, XfaError> {
+    if path.is_empty() || path.len() > MAX_DEPTH || xml.len() > 8 * 1024 * 1024 || crate::xml_nesting_depth(xml) > MAX_DEPTH {
+        return Err(XfaError::TooLarge("loadXML exceeds the size or nesting limit, or has no target".into()));
+    }
+    let parsed = roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 100_000 })
+        .map_err(|e| XfaError::Malformed(format!("loadXML: {e}")))?;
+    let root = parsed.root_element();
+    let markup = if ignore_root {
+        root.children().filter(|n| n.is_element()).filter_map(|n| element_markup(xml, n)).collect::<String>()
+    } else {
+        element_markup(xml, root).ok_or_else(|| XfaError::Malformed("loadXML root is unreadable".into()))?
+    };
+    rewrite(doc, &[Op::LoadXml(path, &markup, overwrite)], reuse)
 }

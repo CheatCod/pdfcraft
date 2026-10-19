@@ -17,5 +17,10 @@ roxmltree = "0.20"
 base64 = "0.22"
 png = "0.18"
 sha2 = "0.11"
-image = { version = "0.25", default-features = false, features = ["gif"] }
+image = { version = "0.25", default-features = false, features = ["gif", "tiff", "bmp"] }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+rxing = { version = "=0.9.3", default-features = false, features = ["pdf417", "encoders", "encoding_rs"] }
+
+[dev-dependencies]
+rxing = { version = "=0.9.3", default-features = false, features = ["pdf417", "decoders", "encoding_rs"] }

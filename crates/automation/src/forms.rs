@@ -271,6 +271,14 @@ impl Automation {
         Ok(json!({ "count": out.len(), "fields": out }))
     }
 
+    pub(crate) fn form_change_preview(&mut self, a: &Args) -> Result<Value> {
+        let id = self.doc(a)?.id;
+        let out = self.session.preview_form_change(id, a.str("field")?, a.str("text")?).map_err(failed)?;
+        Ok(
+            json!({"alerts":out.alerts,"errors":out.errors,"console":out.console,"requests":out.requests.iter().map(crate::a11y::request_json).collect::<Vec<_>>()}),
+        )
+    }
+
     pub(crate) fn form_fill(&mut self, a: &Args) -> Result<Value> {
         let doc = self.doc(a)?;
         let values = a
@@ -288,6 +296,12 @@ impl Automation {
         let edit = if edits.len() == 1 { edits.remove(0) } else { Edit::Batch { label: "Fill in form".into(), edits } };
         let mut out = self.apply(a, edit)?;
         out["filled"] = json!(values.len());
+        let id = self.doc(a)?.id;
+        let output = self.session.take_js_output(id);
+        out["alerts"] = json!(output.alerts);
+        out["errors"] = json!(output.errors);
+        out["console"] = json!(output.console);
+        out["requests"] = json!(output.requests.iter().map(crate::a11y::request_json).collect::<Vec<_>>());
         Ok(out)
     }
 

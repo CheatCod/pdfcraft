@@ -1570,6 +1570,7 @@ pub enum Edit {
     XfaEvent {
         som: String,
         activity: String,
+        dialog_answers: Vec<i32>,
     },
     /// Scan & OCR ▸ Recognize text: put recognised words on `page` as invisible text over the
     /// image (from [`ocr::OcrJob::run`]).
@@ -2436,10 +2437,10 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
             Some(js) => pdfcraft_forms::apply_script_changes(doc, changes, js)?,
             None => pdfcraft_forms::apply_script_changes(doc, changes, &mut pdfcraft_forms::NoScripts)?,
         },
-        Edit::XfaEvent { som, activity } => {
+        Edit::XfaEvent { som, activity, dialog_answers } => {
             let tpl = cx.xfa.clone().ok_or_else(|| EditError::Invalid("this is not a laid-out XFA form, or JavaScript is off".into()))?;
             let mut run = xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false };
-            let ran = xfa::on_event(doc, &tpl, som, activity, &mut run);
+            let ran = xfa::on_event_with_answers(doc, &tpl, som, activity, dialog_answers, &mut run);
             cx.xfa_datasets = run.datasets;
             cx.xfa_ran_away |= run.ran_away;
             ran.map_err(EditError::Invalid)?;
@@ -3120,9 +3121,11 @@ fn sync_xfa_state(doc: &mut Document) {
             if doc.xfa.is_none() {
                 // Back after an undo: the XFA's own warnings apply again, the strip's don't.
                 doc.xfa_warnings.retain(|w| !w.starts_with(XFA_REMOVED_PREFIX));
-                if doc.xfa_template.is_none() && !doc.xfa_scripts_off {
-                    doc.xfa_template = xfa::template(cos);
-                }
+            }
+            // A remerge discards saved form-instance state; undo can restore it. Refresh
+            // the cached model with the current packets, including those transitions.
+            if !doc.xfa_scripts_off {
+                doc.xfa_template = xfa::template(cos);
             }
             doc.xfa = Some(report);
         }
@@ -3169,6 +3172,8 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
         pdfcraft_xfa::image::Kind::Jpeg => Some("image/jpeg"),
         pdfcraft_xfa::image::Kind::Png => Some("image/png"),
         pdfcraft_xfa::image::Kind::Gif => Some("image/gif"),
+        pdfcraft_xfa::image::Kind::Tiff => Some("image/tiff"),
+        pdfcraft_xfa::image::Kind::Bmp => Some("image/bmp"),
     }
 }
 
@@ -4087,6 +4092,24 @@ impl Session {
         Ok(())
     }
 
+    /// Lifecycle scripts operate on the output copy, so a failed Save cannot mutate the
+    /// user's document or consume an undo step. mark_saved installs the successful result.
+    fn xfa_save_copy(&self, doc: &Document) -> Result<Option<pdfcraft_cos::Document>, EditError> {
+        if self.js_off {
+            return Ok(None);
+        }
+        let Some(tpl) = &doc.xfa_template else { return Ok(None) };
+        let Some(editor) = &doc.editor else { return Ok(None) };
+        let mut copy = editor.cos.clone();
+        let mut output = js::JsOutput::default();
+        let mut run = crate::xfa::XfaRun { page_count: doc.info.pages.len(), out: &mut output, datasets: None, ran_away: false };
+        guard(|| crate::xfa::before_save(&mut copy, tpl, &mut run)).map_err(EditError::Write)?.map_err(EditError::Write)?;
+        if let Some(error) = output.errors.first() {
+            return Err(EditError::Write(error.clone()));
+        }
+        Ok(Some(copy))
+    }
+
     /// The bytes to write for Save: an incremental update of the file as opened/last saved,
     /// with `/ModDate` stamped. Call `mark_saved` after writing them successfully.
     ///
@@ -4097,21 +4120,23 @@ impl Session {
     pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
-        let on_saved = Arc::ptr_eq(editor.cos.bytes(), &editor.saved);
-        if !editor.cos.is_modified() && on_saved && (!editor.cos.reconstructed() || doc.is_signed()) {
+        let prepared = self.xfa_save_copy(doc)?;
+        let cos = prepared.as_ref().unwrap_or(&editor.cos);
+        let on_saved = Arc::ptr_eq(cos.bytes(), &editor.saved);
+        if !cos.is_modified() && on_saved && (!cos.reconstructed() || doc.is_signed()) {
             return Ok(editor.saved.clone());
         }
         let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
         // A restored snapshot can be based on an earlier revision. Append to the last saved
         // file so that revision stays in the chain. A full rewrite (redaction, new encryption,
         // a reconstructed file) still writes the current graph on its own.
-        let rewrite = editor.cos.full_save_required() || editor.cos.encryption_changed() || editor.cos.revisions().is_empty();
+        let rewrite = cos.full_save_required() || cos.encryption_changed() || cos.revisions().is_empty();
         guard(|| {
             if on_saved || rewrite {
-                write_incremental(&editor.cos, &opts)
+                write_incremental(cos, &opts)
             } else {
                 let mut base = pdfcraft_cos::Document::open_with_password(editor.saved.clone(), editor.saved_keys.reopen.as_deref())?;
-                base.overlay_changes_from(&editor.cos)?;
+                base.overlay_changes_from(cos)?;
                 write_incremental(&base, &opts)
             }
         })
@@ -4128,7 +4153,11 @@ impl Session {
         }
         let editor = doc.editor.as_ref().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
         let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
-        guard(|| write_full(&editor.cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
+        let prepared = self.xfa_save_copy(doc)?;
+        guard(|| write_full(prepared.as_ref().unwrap_or(&editor.cos), &opts))
+            .map_err(EditError::Write)?
+            .map(Arc::new)
+            .map_err(|e| EditError::Write(e.to_string()))
     }
 
     /// Check that `bytes`, from [`Self::save_bytes`] or [`Self::save_full_bytes`], reopen as this

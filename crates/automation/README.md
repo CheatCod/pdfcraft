@@ -64,6 +64,15 @@ semantics; they never silently act on partial text.
 
 ## Shared field properties
 
+XFA `form_fill` returns the form's validation alerts, errors and focus requests. For interactive
+typing, `form_change_preview {doc, field, text}` previews the change event without saving the
+draft or adding undo steps; commit with `form_fill` before following an automatic focus move.
+
+Run an XFA button with `js_run {doc, field, script:""}`. If it returns a `confirmation` request,
+the document has not changed. Repeat the same call with `dialog_answers` containing the answers
+so far (1 = OK, 2 = Cancel, 3 = No, 4 = Yes). Only codes offered by that dialog are accepted;
+the completed invocation is one undoable edit. Do not automatically accept Clear Form prompts.
+
 For an individual push button, `form_set_props` also edits its visible normal label:
 
 ```json

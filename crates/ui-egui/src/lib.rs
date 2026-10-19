@@ -674,6 +674,7 @@ pub struct PdfCraftApp {
     pub compare: Option<compare_ui::CompareState>,
     /// The JavaScript console and the Document JavaScripts draft.
     pub js_console: js_ui::JsConsole,
+    pub(crate) form_confirmation: Option<js_ui::FormConfirmation>,
     pub doc_js: js_ui::DocJsDraft,
     pub a11y: a11y_ui::A11yState,
     pub(crate) tags_state: tags_ui::State,
@@ -999,6 +1000,7 @@ impl PdfCraftApp {
             compare_old: None,
             compare: None,
             js_console: Default::default(),
+            form_confirmation: None,
             doc_js: Default::default(),
             a11y: a11y_ui::A11yState::default(),
             tags_state: Default::default(),

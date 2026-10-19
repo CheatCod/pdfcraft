@@ -150,6 +150,8 @@ impl Border {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FontSpec {
     pub typeface: Option<String>,
+    /// Character spacing, in points or ems.
+    pub letter_spacing: Option<LetterSpacing>,
     pub size: Option<f64>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
@@ -157,10 +159,17 @@ pub struct FontSpec {
     pub color: Option<Color>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LetterSpacing {
+    Points(f64),
+    Em(f64),
+}
+
 /// A font with every property resolved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Font {
     pub typeface: String,
+    pub letter_spacing: f64,
     pub size: f64,
     pub bold: bool,
     pub italic: bool,
@@ -171,7 +180,7 @@ pub struct Font {
 impl Default for Font {
     /// XFA's default font: Courier 10 pt.
     fn default() -> Self {
-        Font { typeface: "Courier".into(), size: 10.0, bold: false, italic: false, underline: false, color: Color::BLACK }
+        Font { typeface: "Courier".into(), letter_spacing: 0.0, size: 10.0, bold: false, italic: false, underline: false, color: Color::BLACK }
     }
 }
 
@@ -179,6 +188,12 @@ impl Font {
     pub fn apply(&self, spec: &FontSpec) -> Font {
         Font {
             typeface: spec.typeface.clone().unwrap_or_else(|| self.typeface.clone()),
+            letter_spacing: match spec.letter_spacing {
+                Some(LetterSpacing::Points(p)) => p,
+                Some(LetterSpacing::Em(e)) => e * spec.size.unwrap_or(self.size),
+                None => self.letter_spacing,
+            }
+            .clamp(-300.0, 300.0),
             size: spec.size.unwrap_or(self.size),
             bold: spec.bold.unwrap_or(self.bold),
             italic: spec.italic.unwrap_or(self.italic),
@@ -304,6 +319,8 @@ impl Para {
 pub struct Common {
     pub name: Option<String>,
     pub id: Option<String>,
+    /// `None`: normal binding; empty: no data scope; otherwise an explicit data reference.
+    pub bind: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub anchor: Anchor,
@@ -389,6 +406,21 @@ impl Default for Occur {
     }
 }
 
+/// A declaration in a subform's `variables` element, separate from bound field data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Variable {
+    pub name: String,
+    pub value: String,
+    pub script: bool,
+}
+
+/// A named collection of SOM references, used by paper-form barcode scripts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Manifest {
+    pub name: String,
+    pub refs: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Subform {
     pub common: Common,
@@ -396,6 +428,9 @@ pub struct Subform {
     pub children: Vec<Node>,
     /// `<event activity="…"><script>` on the subform (initialize, calculate, …).
     pub scripts: Vec<Script>,
+    /// Named script objects and scalar variables in this subform scope.
+    pub variables: Vec<Variable>,
+    pub manifests: Vec<Manifest>,
     pub page_set: Option<PageSet>,
     pub occur: Occur,
     /// `<breakBefore targetType="pageArea">`: start on a new page.
@@ -472,6 +507,8 @@ pub enum Access {
 pub struct Field {
     pub common: Common,
     pub ui: Ui,
+    /// Script-visible template attributes and properties, indexed by property path.
+    pub properties: std::collections::BTreeMap<String, String>,
     /// The border drawn by the widget itself (`<ui><textEdit><border>`), inside the field.
     pub ui_border: Option<Border>,
     pub ui_margin: Margin,
@@ -489,6 +526,8 @@ pub struct Field {
     /// Choice lists: how the list opens.
     pub choice: ChoiceList,
     pub max_chars: Option<usize>,
+    /// Fixed-width integer picture (num{99}, etc.) for data and display.
+    pub number_digits: Option<usize>,
     pub tooltip: Option<String>,
     pub access: Access,
     /// The edit picture clause (`<ui>…<picture>`), e.g. `date{YYYY-MM-DD}`.
@@ -511,6 +550,9 @@ impl Field {
     /// Other fields keep `v`.
     pub fn saved_value(&self, v: &str) -> String {
         if self.ui != Ui::ChoiceList {
+            if self.number_digits.is_some() && !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                return v.parse::<u64>().map(|n| n.to_string()).unwrap_or_else(|_| v.to_string());
+            }
             return v.to_string();
         }
         // The data holds saved values: one of those is itself, even when another item shows

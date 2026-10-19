@@ -17,7 +17,7 @@ the automation tools) works on it unchanged. The engine does this when it opens 
   page areas, content areas and media; measurements in mm, cm, in, pt and px; fonts, paragraphs,
   margins, borders (edge order rules), captions with reserves, check-button items, pictures,
   rich text (`exData` XHTML: paragraphs, `br`, bold/italic/underline/size spans, embedded fields),
-  inline JPEG, PNG and GIF images, lines, rectangles, occurrences, `breakBefore`/`breakAfter`, overflow
+  inline JPEG, PNG, GIF, TIFF and BMP images, lines, rectangles, occurrences, `breakBefore`/`breakAfter`, overflow
   leaders, `columnWidths` and `colSpan`.
 - **Layout** (`layout`): positioned, `tb`, `lr-tb`/`rl-tb`, `table` and `row` layouts; a
   container without a width is as wide as its content; flow across content areas and pages with
@@ -36,7 +36,7 @@ the automation tools) works on it unchanged. The engine does this when it opens 
 
 - **Data** (`data`): the `datasets` packet. On layout, a field takes its value from the data
   node at its data path: its SOM path without areas, which are named in SOM expressions but are
-  not data scopes (`data_path`, as Adobe's viewers bind) (dates in ISO form, check and radio states by their on values), and a
+  not data scopes, with `bind match="none"` and explicit data references respected (`data_path`) (dates in ISO form, check and radio states by their on values), and a
   repeating subform or row gets as many instances as the data has. `write_datasets` merges the
   AcroForm fields' values (by `/PCSom`, or by the Designer field names of a static form) into
   the existing `xfa:data`: only the bound nodes' text changes and missing nodes are added, so
@@ -54,12 +54,15 @@ be measured exponentially often in their nesting. A measurement budget backs thi
   values, presence and access, and the `ScriptEvent`s in document order, built within
   `MAX_FORM_NODES` objects and cut short, with `truncated` set, past that; `has_scripts` says
   whether a template has any, and the engine skips all of this for forms without), the presence
-  and access overrides scripts make, rows added and removed in the data (`DataOp`s, applied to
+  access and property overrides scripts make, rows added and removed in the data (`DataOp`s, applied to
   the in-memory `DataNode` while an event runs and written by `write_data_ops` as one rewrite of
   the datasets packet per event), and `rerender`, which lays the form out again from template,
   data and overrides. The scripts themselves run in the `js` crate's XFA object model; the
-  engine runs initialize and calculate on open, change, exit, validate and calculate after a
-  field changes, and click for buttons.
+  engine runs initialize, docReady and calculate on open, change, exit, validate and calculate
+  after a field changes, and click for buttons and selected check/radio controls. Named script
+  objects and scalar variables, manifest references, data-source XML, `execEvent` with the target's scope, validation borders, captions,
+  and calculated hidden fields in page-master text are supported. A button confirmation
+  suspends all mutations until the user answers; CLI/MCP callers supply `js_run.dialog_answers`.
 
   Private keys PdfCraft writes (other viewers ignore them):
 
@@ -82,8 +85,9 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
 
 ## Deliberately not done (yet)
 
-- **Data binding** is the default one only: explicit `bind ref` expressions, global binding and
-  data descriptions are not followed (a data description is kept as written, not checked).
+- **Data binding** supports normal binding, unbound containers/fields and relative or absolute
+  data references (including repeated aliases). Global binding and data descriptions are not
+  implemented; a data description is preserved without checking it.
 - **Scripting.** JavaScript (boa) and FormCalc (a native interpreter, `pdfcraft_js::formcalc`)
   share one object model, one set of effects and one set of budgets. FormCalc covers the
   language and the common built-ins (arithmetic, logical, string, date/time, financial, unit);
@@ -91,8 +95,14 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   The object model covers what forms commonly use (`xfa.form`
   navigation and SOM resolution, `rawValue`, `presence`, `access`, instance managers,
   `xfa.host` messages, reset, print, focus and URLs, `xfa.layout` page numbers, `xfa.event`);
-  not `xfa.template`, data descriptions, `xfa.connectionSet`, `border`/`font`/`ui` properties
-  (reads give a sink that accepts writes), `execEvent`, or the change event per keystroke.
+  not `xfa.template`, data descriptions, `xfa.connectionSet`, arbitrary font-property changes,
+  FormCalc via `execEvent`, or persistent change-event mutations per keystroke.
+  The editor previews change-event focus/alerts while typing (also `form_change_preview`),
+  committing the complete draft before an automatic focus move. Script-object local state is
+  shared within an event handler; persistent state belongs in form variables.
+  Dependent dropdowns can clear/add/delete items, select by index and read XML attributes.
+  `remerge()` discards saved instance state and rebuilds from the template/current data,
+  including initialize and calculate events, in one undo step.
   Validate failures show their message and keep the value, as Acrobat does for scripts.
   A hidden instance of a repeating subform hides every instance (overrides apply to the template).
   A repeating subform shows what its data holds once the data holds any instance, else its
@@ -103,7 +113,8 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   iterations (100 000 per call frame for initialize, calculate and validate, 1 000 000 for
   click and change), 2 000 scripts and 50 relayouts per event, and 3 s (open, changes) or 5 s
   (click) of scripts per event, after which the rest are skipped and reported. Only a click may
-  print, save, open a link or move the focus; other events asking are noted in the console.
+  print, save or open a link; other events asking are noted in the console. Validation may
+  focus its invalid field.
   All the scripts of one event (open, a change, a click) run on one thread, each in a fresh
   JavaScript context (or FormCalc interpreter) on a copy of the form as the engine holds it
   then: scripts share nothing, a script that fails halfway leaves nothing behind, and what a
@@ -130,7 +141,13 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   separate lines. Password fields are password text fields. Signature fields are `/Sig` fields
   the app can sign. Image fields show the picture the data or template holds (JPEG, PNG, GIF)
   and are buttons that pick a new one, kept in the data as base64 with its `xfa:contentType`
-  (`write_data_image`); barcode fields show their value as text, not as bars.
+  (`write_data_image`). PDF417 barcode fields produce vector bars through Apache-2.0 rxing,
+  with the declared module width and error correction, bounded input and geometry. Fixed
+  fields fit the rows to their height, as documented for Acrobat in XFA 3.3 pp. 442–443;
+  PDF417 ignores `moduleHeight`. Saved unbound values are restored from the form packet;
+  manifest/ref collections and bound `dataNode` references let scripts regenerate the actual
+  answers after edits. `preSave` handlers run on an output copy, including
+  `xfa.data.saveXML()` for checksum scripts; a script failure leaves the file and editor untouched. Other symbologies return a layout warning.
 - **Data files.** `export_data` writes the data as Acrobat's Export Data does: an XML document
   holding the data alone (the form's root data node at the root, its namespaces declared) or
   an XDP holding the whole datasets and a reference to the PDF. `import_data` takes an XDP, a
@@ -140,6 +157,7 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   the file's markup, and every rewrite of the packet is parsed back before it is written; the
   engine then lays a dynamic form out again from it and runs its calculations.
 - Missing: `keep` constraints, `subformSet` relations, `rl-tb` is mirrored `lr-tb`, font
-  metrics are the approximate Helvetica ones, and line heights are 1.15 × size.
-- Acrobat cannot be an oracle here (clean-room rules): layout follows the specification, and
-  fidelity has been checked by eye on real government forms, not pixel-compared.
+  substitution still differs from the original typefaces, and line heights
+  are 1.15 × size. Standard-14 face metrics and letter spacing are respected.
+- Layout follows the public specification; clean-room black-box observation uses synthetic
+  fixtures only. Document fidelity has been checked by eye on real government forms, not pixel-compared.

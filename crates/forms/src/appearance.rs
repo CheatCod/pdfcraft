@@ -129,13 +129,17 @@ pub struct Da {
     pub size: f64,
     /// The colour operation as written (`0 g`, `1 0 0 rg`, `0 0 0 1 k`).
     pub color: String,
+    pub letter_spacing: f64,
 }
 
 pub fn parse_da(da: &str) -> Da {
     let toks: Vec<&str> = da.split_whitespace().collect();
-    let mut out = Da { font: "Helv".into(), size: 0.0, color: "0 g".into() };
+    let mut out = Da { font: "Helv".into(), size: 0.0, color: "0 g".into(), letter_spacing: 0.0 };
     for (i, t) in toks.iter().enumerate() {
         match *t {
+            "Tc" if i >= 1 => {
+                out.letter_spacing = toks.get(i - 1).and_then(|t| t.parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-300.0, 300.0)
+            }
             "Tf" if i >= 2 => {
                 out.font = toks[i - 2].trim_start_matches('/').to_string();
                 out.size = toks[i - 1].parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(0.0).min(300.0);
@@ -147,6 +151,25 @@ pub fn parse_da(da: &str) -> Da {
         }
     }
     out
+}
+
+/// A push-button label uses its default appearance, including its font resource and colour.
+/// The same encoding fallback as text fields keeps unsupported captions explicit.
+pub(crate) fn button_label(doc: &Document, f: &Field, wd: &Dict, caption: &str, width: f64, height: f64) -> (Vec<u8>, Dict, Option<char>) {
+    let da = parse_da(wd.get(b"DA").and_then(|o| doc.resolve(o).as_string().map(|s| s.to_text())).as_deref().unwrap_or(&f.da));
+    let (font_name, font, enc) = match dr_font(doc, &da.font).filter(|(_, enc)| enc.can_encode(caption)) {
+        Some((font, enc)) => (da.font.clone(), font, enc),
+        None => ("Helv".to_string(), helvetica(), FontText::WinAnsi),
+    };
+    let size = if da.size > 0.0 { da.size } else { ((height - 4.0) * 0.6).clamp(4.0, 14.0) };
+    let tw = enc.width(caption, size);
+    let mut content =
+        format!("BT /{font_name} {} Tf {} 1 0 0 1 {} {} Tm ", n(size), da.color, n((width - tw) / 2.0), n((height - size * 0.7) / 2.0)).into_bytes();
+    content.extend(literal(&enc.encode(caption)));
+    content.extend_from_slice(b" Tj ET\n");
+    let mut fonts = Dict::new();
+    fonts.set(font_name.into_bytes(), font);
+    (content, fonts, enc.first_unencodable(caption))
 }
 
 /// How a field font's text is encoded and measured.
@@ -191,7 +214,11 @@ impl FontText {
 
     fn width(&self, s: &str, size: f64) -> f64 {
         match self {
-            Self::WinAnsi | Self::Simple(_) => helvetica_width(s, size),
+            Self::WinAnsi => helvetica_width(s, size),
+            Self::Simple(metrics) => metrics
+                .encode(s)
+                .map(|bytes| metrics.codes(&bytes).iter().map(|(code, _)| metrics.width(*code)).sum::<f64>() * size)
+                .unwrap_or_else(|| helvetica_width(s, size)),
             Self::Unicode(_) => cjk_width(s, size),
         }
     }
@@ -444,6 +471,15 @@ pub fn field_appearance_drawn(doc: &Document, f: &Field, w: &Widget, values: &[S
     } else {
         values.first().cloned().unwrap_or_default()
     };
+    let text = if let Some(digits) = wd.int(b"PCXfaNumberDigits").filter(|n| (1..=16).contains(n)) {
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            text.parse::<u64>().map(|n| format!("{n:0width$}", width = digits as usize)).unwrap_or(text)
+        } else {
+            text
+        }
+    } else {
+        text
+    };
     let text = if f.has(flags::PASSWORD) { "*".repeat(text.chars().count()) } else { text };
     let can_show = |enc: &FontText| {
         if f.kind == FieldKind::List {
@@ -458,7 +494,7 @@ pub fn field_appearance_drawn(doc: &Document, f: &Field, w: &Widget, values: &[S
         Some((o, enc)) => (da.font.clone(), o, enc),
         None => ("Helv".to_string(), helvetica(), FontText::WinAnsi),
     };
-    let width_of = |text: &str, size: f64| enc.width(text, size);
+    let width_of = |text: &str, size: f64| enc.width(text, size) + da.letter_spacing * text.chars().count().saturating_sub(1) as f64;
     let (mut c, bw) = frame(doc, &wd, width, height);
     let pad = 2.0 + bw;
     let inner_w = (width - 2.0 * pad).max(1.0);
@@ -545,14 +581,15 @@ pub fn field_appearance_drawn(doc: &Document, f: &Field, w: &Widget, values: &[S
     let mut content = c.into_bytes();
     content.extend(
         format!(
-            "/Tx BMC\nq\n{} {} {} {} re W n\nBT\n/{} {} Tf\n{}\n",
+            "/Tx BMC\nq\n{} {} {} {} re W n\nBT\n/{} {} Tf\n{}\n{} Tc\n",
             n(bw),
             n(bw),
             n(width - 2.0 * bw),
             n(height - 2.0 * bw),
             font_name,
             n(size),
-            da.color
+            da.color,
+            n(da.letter_spacing)
         )
         .bytes(),
     );
@@ -698,8 +735,8 @@ mod tests {
 
     #[test]
     fn default_appearance_strings_parse() {
-        assert_eq!(parse_da("/Helv 0 Tf 0 g"), Da { font: "Helv".into(), size: 0.0, color: "0 g".into() });
-        assert_eq!(parse_da("0.1 0.2 0.3 rg /F1 11 Tf"), Da { font: "F1".into(), size: 11.0, color: "0.1 0.2 0.3 rg".into() });
+        assert_eq!(parse_da("/Helv 0 Tf 0 g"), Da { font: "Helv".into(), size: 0.0, color: "0 g".into(), letter_spacing: 0.0 });
+        assert_eq!(parse_da("0.1 0.2 0.3 rg /F1 11 Tf"), Da { font: "F1".into(), size: 11.0, color: "0.1 0.2 0.3 rg".into(), letter_spacing: 0.0 });
         assert_eq!(parse_da("/Cour 9 Tf 0 0 0 1 k").color, "0 0 0 1 k");
         assert_eq!(parse_da("garbage").font, "Helv");
         assert_eq!(stroke_op("1 0 0 rg"), "1 0 0 RG");

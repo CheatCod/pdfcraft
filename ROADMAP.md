@@ -1,5 +1,7 @@
 # PdfCraft roadmap
 
+> **Last reviewed:** 2026-10-19 · **Last updated:** 2026-10-19 · **Change:** minor (M6/M12: XFA validation scripts, confirmation-safe Clear Form, data bindings, rendering and PDF417 barcodes; estimates unchanged)
+
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
 
 > **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-15 · **Change:** minor (M7: the Edit text caret is as tall as the row it is on; estimates unchanged) · **Target:** Adobe Acrobat Pro (Acrobat DC, continuous track 26.002.21931, macOS)
@@ -172,6 +174,7 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 ## Progress log
 
 - **2026-10-19 (M14, #3373):** The main menu and its long submenus scroll in short windows, keeping their commands reachable. Estimates unchanged.
+- **2026-10-19 (M6/M12, XFA forms):** Implemented named script objects, scalar variables, explicit bindings, embedded choice data, scripted validation borders and confirmation-safe Clear Form with Cancel and undo. Corrected button typography, standard-14 text metrics, letter spacing, TIFF/BMP decorations, check marks, numeric display pictures and calculated page-master text. Added dependent dropdowns, nested event scopes, radio-child updates, PDF417 bars fitted to field bounds, bound dataNode payloads and preSave regeneration. Synthetic unit, engine/tool and desktop tests cover the changes; document-specific checks use a private local copy. XFA remains partial; full Acrobat pixel and scripting parity is not claimed. Estimates unchanged.
 
 - **2026-10-18 (M6, #2892):** Push-button normal labels are editable per widget through Options and form_set_props, independently of field names; rendering, undo/redo and incremental/full save/reopen are covered. Estimates unchanged.
 

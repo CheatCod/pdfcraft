@@ -28,7 +28,74 @@ pub(crate) fn scripts_off_notice() -> String {
     tl!("This form's scripts are turned off because one ran too long. Reopen the document to run them again.").to_string()
 }
 
+/// A suspended form-button invocation. The generation binds an answer to the exact
+/// document the user reviewed; closing or editing it invalidates the confirmation.
+#[derive(Clone, Debug)]
+pub(crate) struct FormConfirmation {
+    id: DocId,
+    generation: u64,
+    field: String,
+    script: String,
+    answers: Vec<i32>,
+    message: String,
+    title: String,
+    buttons: i32,
+}
+
+pub(crate) fn confirmation_dialog(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    let Some(pending) = app.form_confirmation.clone() else { return };
+    if app.session.get(pending.id).is_none_or(|d| d.edit_generation() != pending.generation) {
+        app.form_confirmation = None;
+        return;
+    }
+    let mut answer = None;
+    egui::Modal::new(egui::Id::new("xfa_confirmation")).show(ctx, |ui| {
+        ui.set_max_width(480.0);
+        ui.heading(&pending.title);
+        ui.label(&pending.message);
+        ui.horizontal(|ui| {
+            if pending.buttons == 1 {
+                if ui.button(tl!("OK")).clicked() {
+                    answer = Some(1);
+                }
+            } else {
+                if ui.button(tl!("Yes")).clicked() {
+                    answer = Some(4);
+                }
+                if ui.button(tl!("No")).clicked() {
+                    answer = Some(3);
+                }
+            }
+            if pending.buttons != 2 && ui.button(tl!("Cancel")).clicked() {
+                answer = Some(2);
+            }
+        });
+    });
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // A Yes/No prompt has no Cancel return code; dismiss it as No.
+        answer = Some(if pending.buttons == 2 { 3 } else { 2 });
+    }
+    if let Some(answer) = answer {
+        app.form_confirmation = None;
+        let mut answers = pending.answers;
+        answers.push(answer);
+        app.run_button_script_with_answers(pending.id, &pending.field, &pending.script, &answers);
+    }
+}
+
 impl PdfCraftApp {
+    pub(crate) fn preview_form_change(&mut self, id: DocId, field: &str, text: &str) {
+        match self.session.preview_form_change(id, field, text) {
+            Ok(out) => {
+                let moves = out.requests.iter().any(|r| matches!(r, Request::Focus(name) if name != field));
+                if !moves || self.commit_form_typing() {
+                    self.handle_js(id, out);
+                }
+            }
+            Err(e) => self.notify(e.to_string()),
+        }
+    }
+
     /// Act on what scripts produced in document `id`: alerts are shown, console output goes to
     /// the console, print and page requests are carried out, links wait for the user's permission
     /// (form submissions are reported, never sent).
@@ -67,22 +134,59 @@ impl PdfCraftApp {
                     &[("u", &u)],
                 ),
                 Request::SaveAs => self.run_command("file.save_as"),
-                Request::Focus(_) | Request::Beep | Request::Reset(_) => {}
+                Request::Confirm { message, .. } => self.notify(message),
+                Request::Focus(name) => {
+                    if let Some(i) = view
+                        && let Some(f) = self.session.get(id).and_then(|d| d.form.iter().find(|f| f.name == name))
+                        && let Some((wi, widget)) = f.widgets.iter().enumerate().find(|(_, w)| !w.hidden && w.page.is_some())
+                    {
+                        let focus = crate::forms_ui::open_focus(f, wi);
+                        if let Some(page) = widget.page {
+                            self.views[i].go_to_page(page);
+                            if let Some(height) = self.session.get(id).and_then(|d| d.info.pages.get(page)).map(|p| p.height) {
+                                self.views[i].goto = Some((page, ((widget.rect[1] - 60.0) / f64::from(height.max(1.0))).clamp(0.0, 1.0) as f32));
+                            }
+                        }
+                        self.views[i].forms.focus = Some(focus);
+                    }
+                }
+                Request::Beep | Request::Reset(_) => {}
             }
         }
         if let Some(a) = out.alerts.last() {
             self.notify(a.clone());
+        } else if !out.errors.is_empty() {
+            self.notify_tr("A form script could not run. Open the JavaScript Console for details.");
         }
     }
 
     /// Run a push button's JavaScript (its Mouse Up action).
     pub fn run_button_script(&mut self, id: DocId, field: &str, script: &str) {
+        self.run_button_script_with_answers(id, field, script, &[]);
+    }
+
+    fn run_button_script_with_answers(&mut self, id: DocId, field: &str, script: &str, answers: &[i32]) {
         // A script reads the fields: include what's still being typed in one (#166).
         if !self.commit_form_typing() {
             return;
         }
-        match self.session.run_javascript(id, script, Some(field)) {
+        match self.session.run_javascript_with_answers(id, script, Some(field), answers) {
             Ok(o) => {
+                if let Some(Request::Confirm { message, title, buttons }) = o.requests.iter().find(|r| matches!(r, Request::Confirm { .. })) {
+                    if let Some(doc) = self.session.get(id) {
+                        self.form_confirmation = Some(FormConfirmation {
+                            id,
+                            generation: doc.edit_generation(),
+                            field: field.into(),
+                            script: script.into(),
+                            answers: answers.to_vec(),
+                            message: message.clone(),
+                            title: title.clone(),
+                            buttons: *buttons,
+                        });
+                    }
+                    return;
+                }
                 if let Some(i) = self.views.iter().position(|v| v.id == id)
                     && let Some(info) = self.session.get(id).map(|d| d.info.clone())
                 {

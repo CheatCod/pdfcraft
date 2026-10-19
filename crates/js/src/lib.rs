@@ -146,6 +146,12 @@ pub struct DocInfo {
 /// Something a script asked the viewer to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
+    /// A form confirmation; rerun the button with an explicit answer before changing data.
+    Confirm {
+        message: String,
+        title: String,
+        buttons: i32,
+    },
     /// `this.resetForm([names])` (empty: every field).
     Reset(Vec<String>),
     Print,

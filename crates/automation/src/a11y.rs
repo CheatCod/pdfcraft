@@ -646,7 +646,7 @@ impl Automation {
     }
 }
 
-fn request_json(r: &pdfcraft_engine::js::Request) -> Value {
+pub(crate) fn request_json(r: &pdfcraft_engine::js::Request) -> Value {
     use pdfcraft_engine::js::Request as R;
     match r {
         R::Reset(n) => json!({ "reset": n }),
@@ -657,13 +657,26 @@ fn request_json(r: &pdfcraft_engine::js::Request) -> Value {
         R::Focus(f) => json!({ "focus": f }),
         R::Beep => json!({ "beep": true }),
         R::SaveAs => json!({ "save_as": true }),
+        R::Confirm { message, title, buttons } => json!({ "confirmation": { "message": message, "title": title, "buttons": buttons } }),
     }
 }
 
 impl Automation {
     pub(crate) fn js_run(&mut self, a: &Args) -> Result<Value> {
         let id = self.doc(a)?.id;
-        let o = self.session.run_javascript(id, a.str("script")?, a.opt_str("field")?).map_err(failed)?;
+        let answers = match a.0.get("dialog_answers") {
+            Some(v) => v
+                .as_array()
+                .filter(|a| a.len() <= 100)
+                .ok_or_else(|| failed("dialog_answers must be an array of at most 100 codes"))?
+                .iter()
+                .map(|v| {
+                    v.as_i64().filter(|n| (1..=4).contains(n)).map(|n| n as i32).ok_or_else(|| failed("dialog answers must be codes from 1 to 4"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let o = self.session.run_javascript_with_answers(id, a.str("script")?, a.opt_str("field")?, &answers).map_err(failed)?;
         let reqs: Vec<Value> = o.requests.iter().map(request_json).collect();
         Ok(json!({ "alerts": o.alerts, "console": o.console, "requests": reqs, "error": o.error, "result": o.result }))
     }

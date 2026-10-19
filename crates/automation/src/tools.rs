@@ -330,6 +330,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Set several fields at once (one undo step). values maps field names (from form_fields) to: a string for text fields, combo boxes and radio groups (an option), true/false for check boxes, an array of strings for multi-select lists. Appearances are regenerated so every viewer shows the values. A value whose characters the field's font can't draw (Chinese in a Helvetica field) is still saved; `warnings` in the result names the field and character: PdfCraft draws `?` there and asks other viewers to redraw the field from its value.",
         )
         .with(schema(json!({ "doc": doc(), "values": { "type": "object", "description": "Field name → value." } }), &["doc", "values"])),
+        t("form_change_preview", "Preview form typing", "Preview an XFA field's change event with draft text, returning alerts and focus requests without changing the document or undo history. Commit with form_fill before following a focus request. Other script mutations are provisional until commit.")
+            .ro()
+            .with(schema(json!({"doc":doc(),"field":{"type":"string"},"text":{"type":"string","maxLength":65536}}), &["doc","field","text"])),
         t("form_reset", "Clear form", "Reset fields to their default values: all of them, or only those listed. Undoable.")
             .destructive()
             .with(schema(json!({ "doc": doc(), "fields": { "type": "array", "items": { "type": "string" } } }), &["doc"])),
@@ -1049,7 +1052,7 @@ pub fn tools() -> Vec<ToolDef> {
         t("js_run", "Run JavaScript", "Run Acrobat JavaScript in the document, as the JavaScript console does (or as push button `field`'s Mouse Up script when field is given; on a laid-out XFA form, `field` runs that button's XFA click script instead, JavaScript or FormCalc, which can add and remove rows and show or hide subforms). The form object model is available: this/getField, event, app, util, console, display, color, and the document-level scripts. Field changes and resetForm are applied as one undoable step; returns the script's alerts, console output, requests (print, page, url, submit) and error.")
             .cmd("tools.js_console")
             .with(schema(
-                json!({ "doc": doc(), "script": { "type": "string" }, "field": { "type": "string", "description": "Run as this button's Mouse Up event." } }),
+                json!({ "doc": doc(), "script": { "type": "string" }, "field": { "type": "string", "description": "Run as this button's Mouse Up event." }, "dialog_answers": { "type": "array", "maxItems": 100, "items": { "type": "integer", "enum": [1,2,3,4] }, "description": "Answers to XFA confirmations in order: 1 OK, 2 Cancel, 3 No, 4 Yes. Omit to preview the pending confirmation without changing data." } }),
                 &["doc", "script"],
             )),
         t("js_document_scripts", "Document JavaScripts", "List the document-level JavaScripts (name and source), which define functions field scripts use.")

@@ -73,6 +73,7 @@ pub struct Face {
     pub bold: bool,
     pub italic: bool,
     pub size: f64,
+    pub letter_spacing: f64,
     pub color: [f64; 3],
     pub underline: bool,
 }
@@ -81,6 +82,7 @@ impl Face {
     pub fn of(font: &Font) -> Face {
         Face {
             family: Family::of(&font.typeface),
+            letter_spacing: font.letter_spacing,
             bold: font.bold,
             italic: font.italic,
             size: font.size.clamp(1.0, 300.0),
@@ -92,6 +94,7 @@ impl Face {
     pub fn with_run(&self, run: &Run) -> Face {
         Face {
             family: self.family,
+            letter_spacing: self.letter_spacing,
             bold: run.bold.unwrap_or(self.bold),
             italic: run.italic.unwrap_or(self.italic),
             size: run.size.unwrap_or(self.size).clamp(1.0, 300.0),
@@ -106,11 +109,10 @@ impl Face {
 
     /// Advance of `s` at this face's size.
     pub fn width(&self, s: &str) -> f64 {
-        match self.family {
-            Family::Courier => s.chars().count() as f64 * 0.6 * self.size,
-            Family::Helvetica => pdfcraft_fonts::helvetica_width(s, self.size) * if self.bold { 1.04 } else { 1.0 },
-            Family::Times => pdfcraft_fonts::helvetica_width(s, self.size) * if self.bold { 0.96 } else { 0.92 },
-        }
+        pdfcraft_fonts::Std14::from_base_font(self.family.base_font(self.bold, self.italic))
+            .unwrap_or(pdfcraft_fonts::Std14::Helvetica)
+            .text_width(s, self.size)
+            + self.letter_spacing * s.chars().count().saturating_sub(1) as f64
     }
 }
 
@@ -177,6 +179,11 @@ fn words(runs: &[Run], base: &Face, embed: &dyn Fn(&str) -> String) -> Vec<Word>
         }
     }
     out
+}
+
+/// Width before wrapping, for a draw whose template omits its width.
+pub(crate) fn natural_width(rich: &RichText, base: &Face, embed: &dyn Fn(&str) -> String) -> f64 {
+    rich.paragraphs.iter().map(|p| words(&p.runs, base, embed).iter().map(|w| w.width).sum::<f64>()).fold(0.0, f64::max)
 }
 
 /// Lay `rich` out inside `rect` with `para` and `base` face. `embed` resolves embedded fields to

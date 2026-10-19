@@ -144,6 +144,13 @@ fn parse_font(n: Option<XmlNode>) -> FontSpec {
     FontSpec {
         typeface: n.attribute("typeface").map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         size: attr_measure(n, "size").filter(|s| *s > 0.0),
+        letter_spacing: n.attribute("letterSpacing").and_then(|s| {
+            if let Some(s) = s.strip_suffix("em") {
+                s.parse::<f64>().ok().filter(|v| v.is_finite()).map(LetterSpacing::Em)
+            } else {
+                measure(s).map(LetterSpacing::Points)
+            }
+        }),
         bold: n.attribute("weight").map(|w| w == "bold"),
         italic: n.attribute("posture").map(|p| p == "italic"),
         underline: n.attribute("underline").map(|u| u != "0"),
@@ -169,6 +176,11 @@ fn parse_common(n: XmlNode) -> Common {
     Common {
         name: n.attribute("name").map(str::to_string).filter(|s| !s.is_empty()),
         id: n.attribute("id").map(str::to_string),
+        bind: child(n, "bind").and_then(|b| match b.attribute("match") {
+            Some("none") => Some(String::new()),
+            Some("dataRef") => b.attribute("ref").map(str::to_string),
+            _ => None,
+        }),
         x: attr_measure(n, "x"),
         y: attr_measure(n, "y"),
         anchor: Anchor::parse(n.attribute("anchorType")),
@@ -407,6 +419,40 @@ fn parse_items(n: XmlNode, warnings: &mut Vec<String>) -> (Vec<String>, Vec<Stri
     (shown, saved)
 }
 
+/// Bind choice labels and export values to an embedded data source (XFA bindItems).
+/// Only child paths in the datasets model are followed; this never fetches a URL.
+fn bound_items(n: XmlNode) -> Option<(Vec<String>, Vec<String>)> {
+    let bind = child(n, "bindItems")?;
+    let path = bind.attribute("ref")?.strip_prefix("xfa.datasets.")?;
+    let ds = n.document().descendants().find(|n| n.is_element() && n.tag_name().name() == "datasets")?;
+    let mut nodes = vec![ds];
+    for segment in path.split('.').take(64) {
+        let (name, index) = segment.split_once('[').map_or((segment, None), |(n, i)| (n, Some(i.trim_end_matches(']'))));
+        let mut next = Vec::new();
+        for node in nodes {
+            let mut found = node.children().filter(|c| c.is_element() && c.tag_name().name() == name);
+            match index {
+                Some("*") => next.extend(found.take(10_000usize.saturating_sub(next.len()))),
+                i => next.extend(found.nth(i.and_then(|v| v.parse().ok()).unwrap_or(0))),
+            }
+            if next.len() >= 10_000 {
+                break;
+            }
+        }
+        nodes = next;
+    }
+    let value = |node: XmlNode, reference: &str| {
+        if reference == "$" {
+            text_of(node).trim().to_string()
+        } else {
+            node.attribute(reference).map(str::to_string).or_else(|| child(node, reference).map(text_of)).unwrap_or_default()
+        }
+    };
+    let label = bind.attribute("labelRef").unwrap_or("$");
+    let export = bind.attribute("valueRef").unwrap_or("$");
+    Some((nodes.iter().map(|n| value(*n, label)).collect(), nodes.iter().map(|n| value(*n, export)).collect()))
+}
+
 fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
     let ui = child(n, "ui");
     let ui_el = ui.and_then(|u| u.children().find(|c| c.is_element() && c.tag_name().name() != "extras" && c.tag_name().name() != "picture"));
@@ -429,7 +475,7 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
     let scripts = parse_events(n);
     let numeric = matches!(kind, Ui::NumericEdit)
         || value_el.is_some_and(|v| v.children().any(|c| c.is_element() && matches!(c.tag_name().name(), "decimal" | "integer" | "float")));
-    let (items, item_values) = parse_items(n, warnings);
+    let (items, item_values) = bound_items(n).unwrap_or_else(|| parse_items(n, warnings));
     let choice = match (kind == Ui::ChoiceList, ui_el) {
         (true, Some(e)) => {
             let open = e.attribute("open").unwrap_or("onEntry");
@@ -448,8 +494,16 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
         .map(text_of)
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    let mut properties = script_properties(n);
+    if kind == Ui::ChoiceList {
+        let options: Vec<_> = item_values.iter().zip(&items).collect();
+        if let Ok(json) = serde_json::to_string(&options) {
+            properties.insert("$items".into(), json);
+        }
+    }
     Field {
         common: parse_common(n),
+        properties,
         ui: kind,
         ui_border: ui_el.and_then(|e| parse_border(child(e, "border"))),
         ui_margin: parse_margin(ui_el.and_then(|e| child(e, "margin"))),
@@ -462,6 +516,17 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
         item_values,
         choice,
         max_chars,
+        number_digits: child(n, "bind")
+            .and_then(|b| child(b, "picture"))
+            .or_else(|| child(n, "format").and_then(|f| child(f, "picture")))
+            .map(text_of)
+            .and_then(|s| {
+                s.trim()
+                    .strip_prefix("num{")
+                    .and_then(|s| s.strip_suffix('}'))
+                    .filter(|s| !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b == b'9'))
+                    .map(str::len)
+            }),
         tooltip: child(n, "assist").and_then(|a| child(a, "toolTip")).map(text_of).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         access: match n.attribute("access") {
             Some("readOnly") => Access::ReadOnly,
@@ -476,6 +541,52 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
         validate_message,
         numeric,
     }
+}
+
+/// Preserve the small property trees scripts inspect and modify; never include embedded
+/// images or executable source in the property map. Packet parsing already bounds XML depth.
+fn script_properties(n: XmlNode) -> std::collections::BTreeMap<String, String> {
+    fn walk(n: XmlNode, path: &str, out: &mut std::collections::BTreeMap<String, String>, depth: usize) {
+        if depth > 12 || out.len() >= 512 {
+            return;
+        }
+        for a in n.attributes().take(512usize.saturating_sub(out.len())) {
+            out.insert(format!("{path}.{}", a.name()), a.value().to_string());
+        }
+        let mut seen = std::collections::HashMap::<&str, usize>::new();
+        for c in n.children().filter(|c| c.is_element()) {
+            let tag = c.tag_name().name();
+            if matches!(tag, "script" | "exData" | "image") {
+                continue;
+            }
+            let count = seen.entry(tag).or_default();
+            let segment = if *count == 0 { tag.to_string() } else { format!("{tag}[{count}]") };
+            *count += 1;
+            walk(c, &format!("{path}.{segment}"), out, depth + 1);
+        }
+        if !n.children().any(|c| c.is_element())
+            && let Some(t) = n.text()
+        {
+            out.insert(format!("{path}.value"), t.to_string());
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(ui) = child(n, "ui").and_then(|u| u.children().find(|c| c.is_element())) {
+        out.insert("uiType".into(), ui.tag_name().name().to_string());
+    }
+    for tag in ["ui", "border", "validate", "assist", "caption"] {
+        if let Some(c) = child(n, tag) {
+            walk(c, tag, &mut out, 0);
+        }
+    }
+    for (alias, name) in [("validationMessage", "scriptTest"), ("formatMessage", "formatTest"), ("mandatoryMessage", "nullTest")] {
+        if let Some(t) =
+            child(n, "validate").and_then(|v| child(v, "message")).and_then(|m| children(m, "text").find(|t| t.attribute("name") == Some(name)))
+        {
+            out.insert(alias.into(), text_of(t));
+        }
+    }
+    out
 }
 
 fn parse_script(s: XmlNode, activity: &str) -> Script {
@@ -566,6 +677,22 @@ fn parse_subform(n: XmlNode, warnings: &mut Vec<String>, depth: usize) -> Subfor
         layout: Layout::parse(n.attribute("layout")),
         children: children_out,
         scripts: parse_events(n),
+        variables: child(n, "variables")
+            .map(|v| {
+                v.children()
+                    .filter(|c| c.is_element() && c.tag_name().name() != "manifest")
+                    .take(256)
+                    .filter_map(|v| {
+                        Some(Variable { name: v.attribute("name")?.to_string(), value: text_of(v), script: v.tag_name().name() == "script" })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        manifests: children(n, "manifest")
+            .chain(child(n, "variables").into_iter().flat_map(|v| children(v, "manifest")))
+            .take(256)
+            .filter_map(|m| Some(Manifest { name: m.attribute("name")?.to_string(), refs: children(m, "ref").take(4096).map(text_of).collect() }))
+            .collect(),
         page_set,
         occur: parse_occur(child(n, "occur")),
         break_before_page: break_to_page("breakBefore")
@@ -736,6 +863,19 @@ fn apply_saved_state(nodes: &mut [Node], saved: XmlNode, depth: usize) {
                 apply_saved_state(&mut a.children, c, depth + 1);
             }
             Node::Field(f) => {
+                // Unbound fields (notably paper-form barcodes) keep their value in the
+                // saved form packet, since they deliberately have no datasets binding.
+                if f.common.bind.as_deref() == Some("")
+                    && let Some(text) = child(c, "value").and_then(|v| child(v, "text"))
+                {
+                    f.value = Value::Text(text_of(text));
+                }
+                f.properties.extend(script_properties(c));
+                if let Some(ui) = child(c, "ui").and_then(|u| u.children().find(|c| c.is_element()))
+                    && let Some(border) = parse_border(child(ui, "border"))
+                {
+                    f.ui_border = Some(border);
+                }
                 if let Some(p) = presence {
                     f.common.presence = p;
                 }
